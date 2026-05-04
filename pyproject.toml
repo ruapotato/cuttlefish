@@ -1,0 +1,34 @@
+[project]
+name = "cuttlefish"
+version = "0.0.0"
+description = "Self-hosted media server with one-shot pre-encoding instead of on-the-fly transcoding."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+asr = [
+    "torch>=2.2",
+    "nemo_toolkit[asr]>=1.23",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.7",
+]
+
+[project.scripts]
+cuttlefish = "cuttlefish.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cuttlefish"]
