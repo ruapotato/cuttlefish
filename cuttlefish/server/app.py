@@ -10,13 +10,14 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from cuttlefish import auth, cruft as cruft_mod, db, subtitles as subs_mod
 from cuttlefish.clients.opensubtitles import OpenSubtitles
 from cuttlefish.clients.tmdb import TMDb
+from cuttlefish.server.cast import CastBus
 from cuttlefish.server.streaming import stream_file, video_path_for_media
 from cuttlefish.workers import encoder
 
@@ -61,6 +62,7 @@ def create_app(
     # Lazily build clients; allow injection for testing.
     _tmdb = tmdb_client
     _opensubs = opensubtitles_client
+    cast_bus = CastBus()
 
     def get_tmdb() -> TMDb:
         nonlocal _tmdb
@@ -1623,6 +1625,145 @@ def create_app(
             return _page("Register", "<p class='error'>Username taken.</p>", user=None)
         return RedirectResponse("/login", status_code=303)
 
+    # --- Casting ---------------------------------------------------------
+
+    @app.websocket("/api/cast/channel")
+    async def ws_cast(ws: WebSocket):
+        # Authenticate via the session cookie used by the rest of the app.
+        token = ws.cookies.get(auth.SESSION_COOKIE_NAME)
+        if not token:
+            await ws.close(code=4401)
+            return
+        sess = auth.lookup_session(_conn(), token)
+        if not sess:
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        # First message must be {type: 'identify', role, label}
+        try:
+            ident = await ws.receive_json()
+        except Exception:
+            await ws.close()
+            return
+        role = ident.get("role")
+        label = (ident.get("label") or "Unnamed device")[:80]
+        if role not in ("target", "controller"):
+            await ws.close(code=4400)
+            return
+        dev = await cast_bus.register(sess["id"], role, label, ws)
+        await ws.send_json({
+            "type": "registered",
+            "client_id": dev.client_id,
+            "role": role,
+            "targets": cast_bus.list_for(sess["id"], role="target",
+                                          except_id=dev.client_id),
+        })
+        try:
+            while True:
+                msg = await ws.receive_json()
+                msg_type = msg.get("type")
+                if msg_type == "command":
+                    target_id = msg.get("to")
+                    if target_id:
+                        await cast_bus.send_to(
+                            sess["id"], target_id,
+                            {"type": "command",
+                             "from": dev.client_id,
+                             "action": msg.get("action"),
+                             "payload": msg.get("payload") or {}},
+                        )
+                elif msg_type == "state_update":
+                    # Fan out state updates to all controllers for this user
+                    for d in cast_bus.list_for(sess["id"], role="controller"):
+                        await cast_bus.send_to(
+                            sess["id"], d["client_id"],
+                            {"type": "state_update",
+                             "from": dev.client_id,
+                             "media_id": msg.get("media_id"),
+                             "position_seconds": msg.get("position_seconds"),
+                             "playing": msg.get("playing")},
+                        )
+                # Other types ignored — clients shouldn't send them
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await cast_bus.unregister(dev)
+
+    @app.get("/api/cast/targets")
+    def api_cast_targets(request: Request):
+        user = _require_user(request)
+        return cast_bus.list_for(user["id"], role="target")
+
+    @app.get("/cast", response_class=HTMLResponse)
+    def page_cast(request: Request):
+        user = _require_user(request)
+        body = """
+<h2>Cast</h2>
+<p class='hint'>Open the <a href='/'>Libraries</a> page on your TV (or any
+other device, logged in as you) and start playing something. That tab
+becomes a 'target'. From here you can pause / play / seek that target.</p>
+<div id='status' class='hint'>Connecting...</div>
+<div id='targets'></div>
+<script>(function(){
+  var statusEl = document.getElementById('status');
+  var targetsEl = document.getElementById('targets');
+  var ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/api/cast/channel');
+  var myId = null;
+  var targets = {};
+  function render(){
+    var html = '';
+    var keys = Object.keys(targets);
+    if(keys.length===0){
+      html = '<p class=\\'empty\\'>No active targets.</p>';
+    } else {
+      html = '<ul class=\\'media\\'>' + keys.map(function(id){
+        var t = targets[id];
+        return '<li><strong>'+escapeHtml(t.label)+'</strong> '
+          + '<button data-id=\\''+id+'\\' data-action=\\'play\\'>Play</button> '
+          + '<button data-id=\\''+id+'\\' data-action=\\'pause\\'>Pause</button> '
+          + '<button data-id=\\''+id+'\\' data-action=\\'seek-back\\'>-10s</button> '
+          + '<button data-id=\\''+id+'\\' data-action=\\'seek-fwd\\'>+30s</button>'
+          + (t.position!=null ? ' <span class=\\'kind\\'>at '+formatTime(t.position)+'</span>' : '')
+          + '</li>';
+      }).join('') + '</ul>';
+    }
+    targetsEl.innerHTML = html;
+    targetsEl.querySelectorAll('button').forEach(function(b){
+      b.addEventListener('click', function(){ command(b.dataset.id, b.dataset.action); });
+    });
+  }
+  function escapeHtml(s){return String(s).replace(/[&<>\\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\\"':'&quot;',\"'\":'&#39;'}[c];});}
+  function formatTime(s){var m=Math.floor(s/60);var sec=Math.floor(s%60);return m+':'+(sec<10?'0':'')+sec;}
+  function command(id, action){
+    var payload = {};
+    if(action==='seek-back'){ action='seek'; payload.delta = -10; }
+    if(action==='seek-fwd'){ action='seek'; payload.delta = 30; }
+    ws.send(JSON.stringify({type:'command', to:id, action:action, payload:payload}));
+  }
+  ws.addEventListener('open', function(){
+    ws.send(JSON.stringify({type:'identify', role:'controller', label:'Controller'}));
+  });
+  ws.addEventListener('message', function(e){
+    var m = JSON.parse(e.data);
+    if(m.type==='registered'){
+      statusEl.textContent = 'Connected. Listening for targets...';
+      myId = m.client_id;
+      (m.targets||[]).forEach(function(t){ targets[t.client_id] = {label:t.label}; });
+      render();
+    } else if(m.type==='target_available'){
+      targets[m.client_id] = {label:m.label};
+      render();
+    } else if(m.type==='target_gone'){
+      delete targets[m.client_id]; render();
+    } else if(m.type==='state_update'){
+      if(targets[m.from]){ targets[m.from].position = m.position_seconds; render(); }
+    }
+  });
+  ws.addEventListener('close', function(){ statusEl.textContent = 'Disconnected.'; });
+})();</script>
+"""
+        return _page("Cast", body, user=user)
+
     @app.post("/logout")
     def page_logout(request: Request):
         token = request.cookies.get(auth.SESSION_COOKIE_NAME)
@@ -1974,6 +2115,7 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
             "<a href='/'>Libraries</a>"
             "<a href='/continue-watching'>Continue Watching</a>"
             "<a href='/search'>Search</a>"
+            "<a href='/cast'>Cast</a>"
             "</nav>"
         )
     else:
