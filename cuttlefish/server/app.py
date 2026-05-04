@@ -44,6 +44,11 @@ class LibraryCreateBody(BaseModel):
     root_path: str
 
 
+class UserPatchBody(BaseModel):
+    is_admin: Optional[bool] = None
+    password: Optional[str] = None
+
+
 # --- app factory ----------------------------------------------------------
 
 
@@ -778,6 +783,170 @@ def create_app(
         api_admin_scan_all(request)
         return RedirectResponse("/admin/libraries", status_code=303)
 
+    # --- Admin: users -----------------------------------------------------
+
+    def _admin_count(conn) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_admin = 1"
+        ).fetchone()[0]
+
+    @app.get("/api/admin/users")
+    def api_admin_list_users(request: Request):
+        _require_admin(request)
+        rows = _conn().execute(
+            "SELECT id, username, is_admin, created_at FROM users ORDER BY id"
+        ).fetchall()
+        return [{"id": r["id"], "username": r["username"],
+                 "is_admin": bool(r["is_admin"]), "created_at": r["created_at"]}
+                for r in rows]
+
+    @app.delete("/api/admin/users/{user_id}")
+    def api_admin_delete_user(user_id: int, request: Request):
+        actor = _require_admin(request)
+        if actor["id"] == user_id:
+            raise HTTPException(409, "cannot delete your own account")
+        conn = _conn()
+        target = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if target is None:
+            raise HTTPException(404, "user not found")
+        if target["is_admin"] and _admin_count(conn) <= 1:
+            raise HTTPException(409, "cannot delete the last admin")
+        with conn:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return {"ok": True}
+
+    @app.patch("/api/admin/users/{user_id}")
+    def api_admin_patch_user(user_id: int, body: UserPatchBody, request: Request):
+        actor = _require_admin(request)
+        conn = _conn()
+        target = conn.execute(
+            "SELECT id, is_admin FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if target is None:
+            raise HTTPException(404, "user not found")
+        if body.is_admin is not None:
+            if (
+                target["is_admin"]
+                and body.is_admin is False
+                and _admin_count(conn) <= 1
+            ):
+                raise HTTPException(409, "cannot demote the last admin")
+            with conn:
+                conn.execute(
+                    "UPDATE users SET is_admin = ? WHERE id = ?",
+                    (1 if body.is_admin else 0, user_id),
+                )
+        if body.password is not None:
+            if len(body.password) < 6:
+                raise HTTPException(400, "password must be at least 6 characters")
+            with conn:
+                conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ?",
+                    (auth.hash_password(body.password), user_id),
+                )
+        return {"ok": True}
+
+    @app.get("/admin/users", response_class=HTMLResponse)
+    def page_admin_users(request: Request):
+        actor = _require_admin(request)
+        rows = _conn().execute(
+            "SELECT id, username, is_admin, created_at FROM users ORDER BY id"
+        ).fetchall()
+        if not rows:
+            list_html = "<p class='empty'>No users.</p>"
+        else:
+            row_html = "".join(
+                f"<tr>"
+                f"<td>{r['id']}</td>"
+                f"<td>{html.escape(r['username'])}</td>"
+                f"<td>{'admin' if r['is_admin'] else 'user'}</td>"
+                f"<td>{html.escape(r['created_at'] or '')}</td>"
+                f"<td>"
+                + (
+                    f"<form method='post' action='/admin/users/{r['id']}/toggle-admin' style='display:inline'>"
+                    f"<button type='submit'>"
+                    f"{'Demote' if r['is_admin'] else 'Promote'}</button></form> "
+                    if r["id"] != actor["id"]
+                    else ""
+                )
+                + (
+                    f"<form method='post' action='/admin/users/{r['id']}/delete' style='display:inline' "
+                    f"onsubmit='return confirm(\"Delete user {html.escape(r['username'])}?\");'>"
+                    f"<button type='submit'>Delete</button></form>"
+                    if r["id"] != actor["id"]
+                    else "<span class='hint'>(you)</span>"
+                )
+                + "</td>"
+                f"</tr>"
+                for r in rows
+            )
+            list_html = (
+                "<table class='admin'><thead><tr>"
+                "<th>id</th><th>username</th><th>role</th><th>created</th><th></th>"
+                "</tr></thead><tbody>"
+                f"{row_html}</tbody></table>"
+            )
+        body = f"""
+<h2>Users</h2>
+{list_html}
+<h3>Add a user</h3>
+<form method='post' action='/admin/users' class='auth'>
+  <label>Username <input name='username' required></label>
+  <label>Password (>= 6 chars) <input name='password' type='password' minlength='6' required></label>
+  <label><input type='checkbox' name='is_admin' value='1'> Admin</label>
+  <button type='submit'>Create</button>
+</form>
+<p><a href='/admin'>&larr; Admin</a></p>
+"""
+        return _page("Users", body, user=actor)
+
+    @app.post("/admin/users")
+    def page_admin_users_add(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+        is_admin: Optional[str] = Form(None),
+    ):
+        _require_admin(request)
+        if len(password) < 6:
+            raise HTTPException(400, "password must be at least 6 characters")
+        try:
+            auth.create_user(_conn(), username, password, is_admin=bool(is_admin))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "username taken")
+        return RedirectResponse("/admin/users", status_code=303)
+
+    @app.post("/admin/users/{user_id}/toggle-admin")
+    def page_admin_users_toggle(user_id: int, request: Request):
+        actor = _require_admin(request)
+        conn = _conn()
+        row = conn.execute("SELECT is_admin FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "user not found")
+        new_admin = 0 if row["is_admin"] else 1
+        if row["is_admin"] and not new_admin and _admin_count(conn) <= 1:
+            raise HTTPException(409, "cannot demote the last admin")
+        with conn:
+            conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (new_admin, user_id))
+        return RedirectResponse("/admin/users", status_code=303)
+
+    @app.post("/admin/users/{user_id}/delete")
+    def page_admin_users_delete(user_id: int, request: Request):
+        actor = _require_admin(request)
+        if actor["id"] == user_id:
+            raise HTTPException(409, "cannot delete your own account")
+        conn = _conn()
+        target = conn.execute("SELECT is_admin FROM users WHERE id = ?", (user_id,)).fetchone()
+        if target is None:
+            raise HTTPException(404, "user not found")
+        if target["is_admin"] and _admin_count(conn) <= 1:
+            raise HTTPException(409, "cannot delete the last admin")
+        with conn:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return RedirectResponse("/admin/users", status_code=303)
+
     # --- Admin: cruft -----------------------------------------------------
 
     @app.get("/api/admin/cruft")
@@ -842,6 +1011,7 @@ def create_app(
   <li><a href='/admin/cleanup'>Cleanup originals</a> — manual delete after re-encode</li>
   <li><a href='/admin/cruft'>Cruft</a> — non-media files that may be safe to delete</li>
   <li><a href='/admin/libraries'>Libraries</a> — add, scan, delete library roots</li>
+  <li><a href='/admin/users'>Users</a> — manage accounts and admin privileges</li>
 </ul>
 """
         return _page("Admin", body, user=user)
