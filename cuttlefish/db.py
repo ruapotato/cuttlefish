@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -96,6 +96,33 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (user_id, episode_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS encoded_files (
+        media_id      INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+        clean_dir     TEXT    NOT NULL,
+        video_path    TEXT    NOT NULL,
+        subtitle_path TEXT,
+        poster_path   TEXT,
+        size_bytes    INTEGER,
+        encoded_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT    NOT NULL CHECK(kind IN ('encode','subtitle','asr','metadata')),
+        media_id    INTEGER REFERENCES media(id) ON DELETE CASCADE,
+        episode_id  INTEGER REFERENCES tv_episodes(id) ON DELETE CASCADE,
+        status      TEXT    NOT NULL CHECK(status IN ('queued','running','done','failed')) DEFAULT 'queued',
+        payload     TEXT,
+        result      TEXT,
+        error       TEXT,
+        created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        started_at  TEXT,
+        finished_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(kind, status, id)",
 )
 
 

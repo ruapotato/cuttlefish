@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from cuttlefish import auth, db
 from cuttlefish.server.streaming import stream_file, video_path_for_media
+from cuttlefish.workers import encoder
 
 
 # --- request/response models ----------------------------------------------
@@ -212,6 +213,91 @@ def create_app(db_path: Optional[Path | str] = None) -> FastAPI:
             (user["id"],),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Admin: encoding + cleanup ---------------------------------------
+
+    @app.post("/api/admin/encode/{media_id}")
+    def api_admin_enqueue_encode(media_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM media WHERE id = ?", (media_id,)).fetchone() is None:
+            raise HTTPException(404, "media not found")
+        job_id = encoder.enqueue_encode(conn, media_id)
+        return {"ok": True, "job_id": job_id}
+
+    @app.get("/api/admin/jobs")
+    def api_admin_list_jobs(request: Request, status: Optional[str] = None):
+        _require_admin(request)
+        sql = (
+            "SELECT j.id, j.kind, j.media_id, j.status, j.error, j.created_at, "
+            "j.started_at, j.finished_at, m.title_guess "
+            "FROM jobs j LEFT JOIN media m ON m.id = j.media_id"
+        )
+        params: list = []
+        if status:
+            sql += " WHERE j.status = ?"
+            params.append(status)
+        sql += " ORDER BY j.id DESC LIMIT 200"
+        rows = _conn().execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.get("/api/admin/cleanup-candidates")
+    def api_admin_cleanup_candidates(request: Request):
+        """List media where an encoded version exists and the original is still
+        a separate file on disk (i.e. not yet replaced by the clean layout)."""
+        _require_admin(request)
+        rows = _conn().execute(
+            "SELECT m.id, m.title_guess, m.source_path, e.video_path, e.size_bytes "
+            "FROM media m JOIN encoded_files e ON e.media_id = m.id "
+            "ORDER BY m.title_guess"
+        ).fetchall()
+        candidates = []
+        for r in rows:
+            src = Path(r["source_path"])
+            video = Path(r["video_path"])
+            if src.is_file() and src.resolve() != video.resolve():
+                candidates.append(
+                    {
+                        "id": r["id"],
+                        "title_guess": r["title_guess"],
+                        "original_path": str(src),
+                        "encoded_path": str(video),
+                        "encoded_size_bytes": r["size_bytes"],
+                        "original_size_bytes": src.stat().st_size,
+                    }
+                )
+        return candidates
+
+    @app.delete("/api/admin/originals/{media_id}")
+    def api_admin_delete_original(media_id: int, request: Request):
+        """Delete the original loose file for a media item, only after the
+        encoded version is on disk and confirmed playable size > 0."""
+        _require_admin(request)
+        conn = _conn()
+        row = conn.execute(
+            "SELECT m.source_path, e.video_path, e.size_bytes "
+            "FROM media m JOIN encoded_files e ON e.media_id = m.id WHERE m.id = ?",
+            (media_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "media has no encoded version yet")
+        src = Path(row["source_path"])
+        video = Path(row["video_path"])
+        if not video.is_file() or video.stat().st_size == 0:
+            raise HTTPException(409, "encoded file missing or empty; refusing to delete original")
+        if not src.is_file():
+            raise HTTPException(404, "original file not present")
+        if src.resolve() == video.resolve():
+            raise HTTPException(409, "original IS the encoded file; refusing")
+        src.unlink()
+        # Re-point the media row at the encoded path so subsequent scans don't
+        # re-create the original entry.
+        with conn:
+            conn.execute(
+                "UPDATE media SET source_path = ? WHERE id = ?",
+                (str(video.parent), media_id),
+            )
+        return {"ok": True, "deleted": str(src)}
 
     # --- HTML pages ------------------------------------------------------
 

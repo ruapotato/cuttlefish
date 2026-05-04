@@ -114,6 +114,39 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_encode_worker(args: argparse.Namespace) -> int:
+    import logging
+
+    from cuttlefish.workers import encoder
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    n = encoder.run_worker(
+        db_path=args.db, once=args.once, poll_interval=args.poll, ffmpeg=args.ffmpeg
+    )
+    print(f"processed {n} job(s)")
+    return 0
+
+
+def cmd_encode_now(args: argparse.Namespace) -> int:
+    """Encode a single media item synchronously (no queue)."""
+    import logging
+
+    from cuttlefish.workers import encoder
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    conn = db.connect(args.db)
+    db.init_schema(conn)
+    try:
+        result = encoder.encode_media(
+            conn, args.media_id, ffmpeg=args.ffmpeg, overwrite=args.overwrite
+        )
+    except encoder.EncodeError as e:
+        print(f"encode failed: {e}", file=sys.stderr)
+        return 1
+    print(f"encoded {result.video_path} ({result.size_bytes} bytes)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="cuttlefish", description="Self-hosted media server."
@@ -151,6 +184,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("encode-worker", help="Run the encode worker loop.")
+    p.add_argument("--once", action="store_true", help="Process one job and exit.")
+    p.add_argument("--poll", type=float, default=5.0, help="Seconds between polls when idle.")
+    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path.")
+    p.set_defaults(func=cmd_encode_worker)
+
+    p = sub.add_parser("encode-now", help="Encode one media item synchronously (bypassing the queue).")
+    p.add_argument("media_id", type=int)
+    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path.")
+    p.add_argument("--overwrite", action="store_true", help="Re-encode even if output exists.")
+    p.set_defaults(func=cmd_encode_now)
 
     args = parser.parse_args(argv)
 
