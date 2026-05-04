@@ -90,7 +90,34 @@ uv run cuttlefish-asr-worker
 
 ## Configuration
 
-A single TOML file controls library paths, TLS, and external API credentials. Format and location TBD — see `cuttlefish/config.py` once it exists.
+External API credentials are read from environment variables:
+
+| Variable | Used for | Required |
+|---|---|---|
+| `TMDB_API_KEY` | Movie/show metadata + posters | Optional (lookups no-op without it) |
+| `OPENSUBTITLES_API_KEY` | Subtitle search | Optional |
+| `OPENSUBTITLES_USERNAME` / `OPENSUBTITLES_PASSWORD` | Subtitle download | Required if you want OpenSubtitles to actually download files |
+
+The DB defaults to `$XDG_DATA_HOME/cuttlefish/cuttlefish.db` (typically
+`~/.local/share/cuttlefish/cuttlefish.db`). Override with `--db PATH`.
+
+## CLI
+
+```bash
+uv run cuttlefish init-db
+uv run cuttlefish add-library open_movies /path/to/movies --kind movies
+uv run cuttlefish scan
+uv run cuttlefish list-media
+uv run cuttlefish serve --host 0.0.0.0 --port 8000
+uv run cuttlefish encode-worker        # background re-encode loop
+uv run cuttlefish encode-now <id>      # one-shot synchronous encode
+uv run cuttlefish asr-worker           # background subtitle generator (needs --extra asr)
+```
+
+## Deferred designs
+
+- [TLS](docs/tls.md) — Let's Encrypt + DNS-01 via certbot, pluggable DNS provider.
+- [Casting / multi-device control](docs/casting.md) — websocket-based session control.
 
 ## License
 
