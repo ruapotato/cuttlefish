@@ -110,10 +110,39 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     import uvicorn
 
+    from cuttlefish import config as cfg_mod
     from cuttlefish.server import create_app
     from cuttlefish.workers import asr, encoder
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # Config file is layered *under* CLI defaults: CLI flags win because
+    # argparse already filled them. We only adopt config values when the
+    # CLI value matches the parser's default (i.e. user didn't pass it).
+    if args.config:
+        cfg = cfg_mod.load_or_die(args.config)
+        if cfg.db and args.db is None:
+            args.db = str(cfg.db)
+        # Sentinels matching parser defaults
+        if args.host == "127.0.0.1":
+            args.host = cfg.server.host
+        if args.port == 8000:
+            args.port = cfg.server.port
+        if not args.with_worker:
+            args.with_worker = cfg.server.with_worker
+        if not args.with_asr_worker:
+            args.with_asr_worker = cfg.server.with_asr_worker
+        if args.ffmpeg == "ffmpeg":
+            args.ffmpeg = cfg.server.ffmpeg
+        if cfg.libraries:
+            from cuttlefish import db as _db
+            conn = _db.connect(args.db)
+            _db.init_schema(conn)
+            added, updated = cfg.apply_libraries(conn)
+            print(
+                f"config: applied libraries (added={added}, updated={updated})",
+                file=sys.stderr,
+            )
 
     if args.with_worker:
         t = threading.Thread(
@@ -239,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--with-asr-worker", action="store_true",
                    help="Also run the ASR worker in a background thread (needs [asr] extra).")
     p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path for embedded workers.")
+    p.add_argument("--config", help="Path to a TOML config file (see docs/configuration.md).")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("encode-worker", help="Run the encode worker loop.")

@@ -38,6 +38,12 @@ class CruftDeleteBody(BaseModel):
     path: str
 
 
+class LibraryCreateBody(BaseModel):
+    name: str
+    kind: str
+    root_path: str
+
+
 # --- app factory ----------------------------------------------------------
 
 
@@ -601,6 +607,177 @@ def create_app(
         job_id = encoder.enqueue_episode_encode(conn, episode_id)
         return {"ok": True, "job_id": job_id}
 
+    # --- Admin: libraries (CRUD + scan) ---------------------------------
+
+    @app.post("/api/admin/libraries")
+    def api_admin_create_library(body: LibraryCreateBody, request: Request):
+        _require_admin(request)
+        from cuttlefish.config import VALID_KINDS
+        if body.kind not in VALID_KINDS:
+            raise HTTPException(400, f"kind must be one of {VALID_KINDS}")
+        root = Path(body.root_path).expanduser()
+        if not root.is_dir():
+            raise HTTPException(400, f"root path is not a directory: {root}")
+        try:
+            with _conn() as conn:
+                cur = conn.execute(
+                    "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
+                    (body.name, body.kind, str(root.resolve())),
+                )
+            return {"ok": True, "id": cur.lastrowid}
+        except sqlite3.IntegrityError as e:
+            raise HTTPException(409, f"library name or root already exists: {e}")
+
+    @app.delete("/api/admin/libraries/{library_id}")
+    def api_admin_delete_library(library_id: int, request: Request):
+        _require_admin(request)
+        with _conn() as conn:
+            cur = conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "library not found")
+        return {"ok": True}
+
+    @app.post("/api/admin/scan/{library_id}")
+    def api_admin_scan_one(library_id: int, request: Request):
+        _require_admin(request)
+        from cuttlefish import scanner as scn
+        conn = _conn()
+        row = conn.execute(
+            "SELECT root_path, kind FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "library not found")
+        result = scn.scan_library(conn, library_id, Path(row["root_path"]), row["kind"])
+        return {
+            "ok": True,
+            "movies_added": result.movies_added,
+            "shows_added": result.shows_added,
+            "episodes_added": result.episodes_added,
+            "audiobooks_added": result.audiobooks_added,
+            "tracks_added": result.tracks_added,
+            "skipped": result.skipped,
+        }
+
+    @app.post("/api/admin/scan")
+    def api_admin_scan_all(request: Request):
+        _require_admin(request)
+        from cuttlefish import scanner as scn
+        conn = _conn()
+        rows = conn.execute("SELECT id, root_path, kind FROM libraries").fetchall()
+        total = scn.ScanResult()
+        for r in rows:
+            try:
+                total.merge(scn.scan_library(conn, r["id"], Path(r["root_path"]), r["kind"]))
+            except Exception as e:
+                # Don't break the loop on one bad library
+                continue
+        return {
+            "ok": True,
+            "movies_added": total.movies_added,
+            "shows_added": total.shows_added,
+            "episodes_added": total.episodes_added,
+            "audiobooks_added": total.audiobooks_added,
+            "tracks_added": total.tracks_added,
+            "skipped": total.skipped,
+            "scanned_libraries": len(rows),
+        }
+
+    @app.get("/admin/libraries", response_class=HTMLResponse)
+    def page_admin_libraries(request: Request):
+        user = _require_admin(request)
+        rows = _conn().execute(
+            "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
+        ).fetchall()
+        if not rows:
+            list_html = "<p class='empty'>No libraries yet.</p>"
+        else:
+            row_html = "".join(
+                f"<tr>"
+                f"<td>{r['id']}</td>"
+                f"<td>{html.escape(r['name'])}</td>"
+                f"<td>{r['kind']}</td>"
+                f"<td><code>{html.escape(r['root_path'])}</code></td>"
+                f"<td>"
+                f"<form method='post' action='/admin/libraries/{r['id']}/scan' style='display:inline'>"
+                f"<button type='submit'>Scan</button></form> "
+                f"<form method='post' action='/admin/libraries/{r['id']}/delete' style='display:inline' "
+                f"onsubmit='return confirm(\"Delete library {html.escape(r['name'])}? Media rows will be removed too.\");'>"
+                f"<button type='submit'>Delete</button></form>"
+                f"</td>"
+                f"</tr>"
+                for r in rows
+            )
+            list_html = (
+                "<table class='admin'><thead><tr>"
+                "<th>id</th><th>name</th><th>kind</th><th>root</th><th></th>"
+                "</tr></thead><tbody>"
+                f"{row_html}</tbody></table>"
+                "<form method='post' action='/admin/libraries/scan-all' style='margin-top:1rem'>"
+                "<button type='submit'>Scan all libraries</button></form>"
+            )
+        body = f"""
+<h2>Libraries</h2>
+{list_html}
+<h3>Add a library</h3>
+<form method='post' action='/admin/libraries' class='auth'>
+  <label>Name <input name='name' required></label>
+  <label>Kind
+    <select name='kind' required>
+      <option value='movies'>Movies</option>
+      <option value='tv'>TV</option>
+      <option value='audiobooks'>Audiobooks</option>
+    </select>
+  </label>
+  <label>Root path <input name='root_path' placeholder='/data/Movies' required></label>
+  <button type='submit'>Add</button>
+</form>
+<p><a href='/admin'>&larr; Admin</a></p>
+"""
+        return _page("Libraries", body, user=user)
+
+    @app.post("/admin/libraries")
+    def page_admin_libraries_add(
+        request: Request,
+        name: str = Form(...),
+        kind: str = Form(...),
+        root_path: str = Form(...),
+    ):
+        _require_admin(request)
+        from cuttlefish.config import VALID_KINDS
+        if kind not in VALID_KINDS:
+            raise HTTPException(400, f"kind must be one of {VALID_KINDS}")
+        root = Path(root_path).expanduser()
+        if not root.is_dir():
+            raise HTTPException(400, f"root path is not a directory: {root}")
+        try:
+            with _conn() as conn:
+                conn.execute(
+                    "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
+                    (name, kind, str(root.resolve())),
+                )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "library name or root already exists")
+        return RedirectResponse("/admin/libraries", status_code=303)
+
+    @app.post("/admin/libraries/{library_id}/scan")
+    def page_admin_libraries_scan(library_id: int, request: Request):
+        _require_admin(request)
+        api_admin_scan_one(library_id, request)
+        return RedirectResponse("/admin/libraries", status_code=303)
+
+    @app.post("/admin/libraries/{library_id}/delete")
+    def page_admin_libraries_delete(library_id: int, request: Request):
+        _require_admin(request)
+        with _conn() as conn:
+            conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
+        return RedirectResponse("/admin/libraries", status_code=303)
+
+    @app.post("/admin/libraries/scan-all")
+    def page_admin_libraries_scan_all(request: Request):
+        _require_admin(request)
+        api_admin_scan_all(request)
+        return RedirectResponse("/admin/libraries", status_code=303)
+
     # --- Admin: cruft -----------------------------------------------------
 
     @app.get("/api/admin/cruft")
@@ -664,6 +841,7 @@ def create_app(
   <li><a href='/admin/jobs'>Jobs</a> — {counts['queued']} queued, {counts['running']} running, {counts['failed']} failed</li>
   <li><a href='/admin/cleanup'>Cleanup originals</a> — manual delete after re-encode</li>
   <li><a href='/admin/cruft'>Cruft</a> — non-media files that may be safe to delete</li>
+  <li><a href='/admin/libraries'>Libraries</a> — add, scan, delete library roots</li>
 </ul>
 """
         return _page("Admin", body, user=user)
