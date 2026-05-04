@@ -105,8 +105,13 @@ def cmd_list_media(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    print("cuttlefish serve: not yet implemented", file=sys.stderr)
-    return 1
+    import uvicorn
+
+    from cuttlefish.server import create_app
+
+    app = create_app(db_path=args.db)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -143,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_list_media)
 
     p = sub.add_parser("serve", help="Run the cuttlefish web server.")
+    p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
+    p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     p.set_defaults(func=cmd_serve)
 
     args = parser.parse_args(argv)
