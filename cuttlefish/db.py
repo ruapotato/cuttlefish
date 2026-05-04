@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -57,6 +57,43 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         first_seen_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
         last_seen_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(book_id, source_path)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        username      TEXT    NOT NULL UNIQUE,
+        password_hash TEXT    NOT NULL,
+        is_admin      INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        token       TEXT    PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at  TEXT    NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS media_progress (
+        user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        media_id         INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+        position_seconds REAL    NOT NULL,
+        duration_seconds REAL,
+        updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, media_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS episode_progress (
+        user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        episode_id       INTEGER NOT NULL REFERENCES tv_episodes(id) ON DELETE CASCADE,
+        position_seconds REAL    NOT NULL,
+        duration_seconds REAL,
+        updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, episode_id)
     )
     """,
 )
