@@ -525,6 +525,209 @@ def create_app(
             )
         return {"ok": True, "job_id": cur.lastrowid}
 
+    # --- Admin HTML pages -----------------------------------------------
+
+    @app.get("/admin", response_class=HTMLResponse)
+    def page_admin(request: Request):
+        user = _require_admin(request)
+        conn = _conn()
+        counts = conn.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM media) AS media, "
+            "(SELECT COUNT(*) FROM encoded_files) AS encoded, "
+            "(SELECT COUNT(*) FROM jobs WHERE status='queued') AS queued, "
+            "(SELECT COUNT(*) FROM jobs WHERE status='running') AS running, "
+            "(SELECT COUNT(*) FROM jobs WHERE status='failed') AS failed"
+        ).fetchone()
+        body = f"""
+<h2>Admin</h2>
+<p>Logged in as <strong>{html.escape(user['username'])}</strong> (admin).</p>
+<ul>
+  <li><a href='/admin/encode'>Encode media</a> — {counts['media'] - counts['encoded']} not yet encoded</li>
+  <li><a href='/admin/jobs'>Jobs</a> — {counts['queued']} queued, {counts['running']} running, {counts['failed']} failed</li>
+  <li><a href='/admin/cleanup'>Cleanup originals</a> — manual delete after re-encode</li>
+</ul>
+"""
+        return _page("Admin", body, user=user)
+
+    @app.get("/admin/jobs", response_class=HTMLResponse)
+    def page_admin_jobs(request: Request):
+        user = _require_admin(request)
+        rows = _conn().execute(
+            "SELECT j.id, j.kind, j.media_id, j.status, j.error, j.created_at, "
+            "j.started_at, j.finished_at, m.title_guess "
+            "FROM jobs j LEFT JOIN media m ON m.id = j.media_id "
+            "ORDER BY j.id DESC LIMIT 100"
+        ).fetchall()
+        if not rows:
+            body = "<h2>Jobs</h2><p class='empty'>No jobs.</p>"
+        else:
+            row_html = "".join(
+                f"<tr><td>{r['id']}</td><td>{r['kind']}</td>"
+                f"<td>{html.escape(r['title_guess'] or '')}</td>"
+                f"<td class='status-{r['status']}'>{r['status']}</td>"
+                f"<td>{html.escape(r['created_at'] or '')}</td>"
+                f"<td>{html.escape(r['finished_at'] or '')}</td>"
+                f"<td class='error'>{html.escape((r['error'] or '')[:120])}</td></tr>"
+                for r in rows
+            )
+            body = (
+                "<h2>Jobs</h2>"
+                "<table class='admin'><thead><tr>"
+                "<th>id</th><th>kind</th><th>media</th><th>status</th>"
+                "<th>created</th><th>finished</th><th>error</th>"
+                "</tr></thead><tbody>"
+                f"{row_html}</tbody></table>"
+                "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        return _page("Jobs", body, user=user)
+
+    @app.get("/admin/cleanup", response_class=HTMLResponse)
+    def page_admin_cleanup(request: Request):
+        user = _require_admin(request)
+        rows = _conn().execute(
+            "SELECT m.id, m.title_guess, m.source_path, e.video_path, e.size_bytes "
+            "FROM media m JOIN encoded_files e ON e.media_id = m.id "
+            "ORDER BY m.title_guess"
+        ).fetchall()
+        candidates = []
+        for r in rows:
+            src = Path(r["source_path"])
+            video = Path(r["video_path"])
+            if src.is_file() and src.resolve() != video.resolve():
+                candidates.append({
+                    "id": r["id"],
+                    "title": r["title_guess"],
+                    "original": src,
+                    "encoded": video,
+                    "encoded_size": r["size_bytes"],
+                    "original_size": src.stat().st_size,
+                })
+        if not candidates:
+            body = (
+                "<h2>Cleanup originals</h2>"
+                "<p class='empty'>No originals are ready for deletion. "
+                "Encode something first, then come back.</p>"
+                "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        else:
+            row_html = "".join(
+                f"<tr>"
+                f"<td>{html.escape(c['title'])}</td>"
+                f"<td><span class='size'>{_human_size(c['original_size'])}</span><br>"
+                f"<small>{html.escape(c['original'].name)}</small></td>"
+                f"<td><span class='size'>{_human_size(c['encoded_size'])}</span><br>"
+                f"<small>{html.escape(c['encoded'].name)}</small></td>"
+                f"<td><form method='post' action='/admin/originals/{c['id']}/delete' "
+                f"onsubmit='return confirm(\"Delete original {html.escape(c['original'].name)}? This cannot be undone.\");'>"
+                f"<button type='submit'>Delete original</button></form></td>"
+                f"</tr>"
+                for c in candidates
+            )
+            body = (
+                "<h2>Cleanup originals</h2>"
+                "<p class='hint'>The originals listed below have an encoded "
+                "version on disk. Deleting them frees space and finishes the "
+                "clean Title/Title.mp4 layout.</p>"
+                "<table class='admin'><thead><tr>"
+                "<th>title</th><th>original</th><th>encoded</th><th></th>"
+                "</tr></thead><tbody>"
+                f"{row_html}</tbody></table>"
+                "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        return _page("Cleanup originals", body, user=user)
+
+    @app.get("/admin/encode", response_class=HTMLResponse)
+    def page_admin_encode(request: Request):
+        user = _require_admin(request)
+        rows = _conn().execute(
+            "SELECT m.id, m.kind, m.title_guess, l.name AS library "
+            "FROM media m JOIN libraries l ON l.id = m.library_id "
+            "LEFT JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE e.media_id IS NULL "
+            "ORDER BY m.kind, m.title_guess "
+            "LIMIT 200"
+        ).fetchall()
+        if not rows:
+            body = (
+                "<h2>Encode media</h2>"
+                "<p class='empty'>Everything in the library is already "
+                "encoded.</p><p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        else:
+            row_html = "".join(
+                f"<tr><td>{html.escape(r['library'])}</td>"
+                f"<td>{r['kind']}</td>"
+                f"<td>{html.escape(r['title_guess'])}</td>"
+                f"<td>"
+                f"<form method='post' action='/admin/encode/{r['id']}'>"
+                f"<button type='submit'>Enqueue encode</button></form>"
+                f"</td></tr>"
+                for r in rows
+            )
+            body = (
+                "<h2>Encode media</h2>"
+                "<p class='hint'>One-shot encode to H.264/AAC/MP4 1080p. The "
+                "encoder worker (run via "
+                "<code>uv run cuttlefish encode-worker</code>) picks jobs up "
+                "from the queue. Originals are kept until you confirm delete.</p>"
+                "<table class='admin'><thead><tr>"
+                "<th>library</th><th>kind</th><th>title</th><th></th>"
+                "</tr></thead><tbody>"
+                f"{row_html}</tbody></table>"
+                "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        return _page("Encode", body, user=user)
+
+    @app.post("/admin/encode/{media_id}")
+    def page_admin_encode_submit(media_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM media WHERE id = ?", (media_id,)).fetchone() is None:
+            raise HTTPException(404, "media not found")
+        encoder.enqueue_encode(conn, media_id)
+        return RedirectResponse("/admin/jobs", status_code=303)
+
+    @app.post("/admin/originals/{media_id}/delete")
+    def page_admin_delete_original(media_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        row = conn.execute(
+            "SELECT m.source_path, e.video_path, e.size_bytes "
+            "FROM media m JOIN encoded_files e ON e.media_id = m.id WHERE m.id = ?",
+            (media_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "media has no encoded version yet")
+        src = Path(row["source_path"])
+        video = Path(row["video_path"])
+        if not video.is_file() or video.stat().st_size == 0:
+            raise HTTPException(409, "encoded file missing or empty")
+        if not src.is_file():
+            return RedirectResponse("/admin/cleanup", status_code=303)
+        if src.resolve() == video.resolve():
+            raise HTTPException(409, "original IS the encoded file")
+        src.unlink()
+        with conn:
+            conn.execute(
+                "UPDATE media SET source_path = ? WHERE id = ?",
+                (str(video.parent), media_id),
+            )
+        return RedirectResponse("/admin/cleanup", status_code=303)
+
+    # --- Health ---------------------------------------------------------
+
+    @app.get("/health")
+    def health():
+        try:
+            row = _conn().execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            schema_version = int(row["value"]) if row else None
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
+        return {"ok": True, "schema_version": schema_version}
+
     # --- HTML pages ------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
@@ -872,7 +1075,23 @@ table.admin th, table.admin td { padding: .35rem .5rem;
                                   border-bottom: 1px solid #222; text-align: left; }
 table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .size { color: #888; font-size: .85em; }
+.status-queued  { color: #aaa; }
+.status-running { color: #fc6; }
+.status-done    { color: #6c6; }
+.status-failed  { color: #f66; }
 """
+
+
+def _human_size(n: Optional[int]) -> str:
+    if n is None:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    f = float(n)
+    for u in units:
+        if f < 1024 or u == units[-1]:
+            return f"{f:.1f} {u}" if u != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{int(n)} B"
 
 
 def _watch_url(kind: str, media_id: int) -> str:
@@ -914,9 +1133,11 @@ def _login_form_html() -> str:
 
 def _page(title: str, body_html: str, user: Optional[dict]) -> str:
     if user:
+        admin_link = " · <a href='/admin'>Admin</a>" if user['is_admin'] else ""
         userbar = (
             f"<span class='userbar'>{html.escape(user['username'])}"
             + (" (admin)" if user['is_admin'] else "")
+            + admin_link
             + " · <form method='post' action='/logout'><button>Log out</button></form>"
             + "</span>"
         )
