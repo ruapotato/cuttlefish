@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from cuttlefish import auth, cruft as cruft_mod, db
+from cuttlefish import auth, cruft as cruft_mod, db, subtitles as subs_mod
 from cuttlefish.clients.opensubtitles import OpenSubtitles
 from cuttlefish.clients.tmdb import TMDb
 from cuttlefish.server.streaming import stream_file, video_path_for_media
@@ -163,6 +163,31 @@ def create_app(
         if not row:
             raise HTTPException(404, "track not found")
         return stream_file(Path(row["source_path"]), request)
+
+    # --- Subtitles served as WebVTT (browser-native captions) -----------
+
+    def _serve_vtt(path: Path):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if path.suffix.lower() == ".srt":
+            text = subs_mod.srt_to_vtt(text)
+        elif not text.lstrip().startswith("WEBVTT"):
+            text = "WEBVTT\n\n" + text
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(text, media_type="text/vtt")
+
+    @app.get("/subtitle/{media_id}")
+    def subtitle_for_media(media_id: int):
+        sub = subs_mod.subtitle_for_media(_conn(), media_id)
+        if sub is None:
+            raise HTTPException(404, "no subtitle available for this media")
+        return _serve_vtt(sub)
+
+    @app.get("/subtitle/episode/{episode_id}")
+    def subtitle_for_episode(episode_id: int):
+        sub = subs_mod.subtitle_for_episode(_conn(), episode_id)
+        if sub is None:
+            raise HTTPException(404, "no subtitle available for this episode")
+        return _serve_vtt(sub)
 
     # --- Auth API --------------------------------------------------------
 
@@ -909,9 +934,16 @@ def create_app(
         if row["kind"] == "audiobook":
             return RedirectResponse(f"/book/{media_id}", status_code=303)
         title = html.escape(row["title_guess"])
+        track_html = (
+            f"<track kind='subtitles' label='Subtitles' srclang='en' "
+            f"src='/subtitle/{media_id}' default>"
+            if subs_mod.subtitle_for_media(_conn(), media_id) is not None
+            else ""
+        )
         body = (
             f"<h2>{title}</h2>"
             f"<video id='player' controls preload='metadata' src='/stream/{media_id}'>"
+            f"{track_html}"
             "Your browser does not support the video element.</video>"
             "<p><a href='/'>&larr; Libraries</a></p>"
             + _player_progress_js(f"/api/progress/{media_id}")
@@ -963,10 +995,17 @@ def create_app(
             raise HTTPException(404, "episode not found")
         ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
         title = f"{row['show_title']} {ep_label}"
+        track_html = (
+            f"<track kind='subtitles' label='Subtitles' srclang='en' "
+            f"src='/subtitle/episode/{episode_id}' default>"
+            if subs_mod.subtitle_for_episode(_conn(), episode_id) is not None
+            else ""
+        )
         body = (
             f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
             f"<p>{html.escape(row['title_guess'] or '')}</p>"
             f"<video id='player' controls preload='metadata' src='/stream/episode/{episode_id}'>"
+            f"{track_html}"
             "Your browser does not support the video element.</video>"
             f"<p><a href='/show/{row['show_id']}'>&larr; All episodes</a></p>"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
@@ -1152,6 +1191,151 @@ def create_app(
         resp.delete_cookie(auth.SESSION_COOKIE_NAME, path="/")
         return resp
 
+    # --- Search ---------------------------------------------------------
+
+    @app.get("/api/search")
+    def api_search(q: str):
+        if not q or not q.strip():
+            return {"media": [], "episodes": []}
+        like = f"%{q.strip()}%"
+        conn = _conn()
+        media = conn.execute(
+            "SELECT m.id, m.kind, m.title_guess, l.name AS library "
+            "FROM media m JOIN libraries l ON l.id = m.library_id "
+            "WHERE m.title_guess LIKE ? COLLATE NOCASE "
+            "ORDER BY m.kind, m.title_guess LIMIT 50",
+            (like,),
+        ).fetchall()
+        episodes = conn.execute(
+            "SELECT e.id, e.season, e.episode, e.title_guess, "
+            "       m.id AS show_id, m.title_guess AS show_title "
+            "FROM tv_episodes e JOIN media m ON m.id = e.show_id "
+            "WHERE e.title_guess LIKE ? COLLATE NOCASE "
+            "ORDER BY m.title_guess, e.season, e.episode LIMIT 50",
+            (like,),
+        ).fetchall()
+        return {
+            "media": [dict(r) for r in media],
+            "episodes": [dict(r) for r in episodes],
+        }
+
+    @app.get("/search", response_class=HTMLResponse)
+    def page_search(request: Request, q: str = ""):
+        user = _current_user(request)
+        q = q.strip()
+        results_html = ""
+        if q:
+            data = api_search(q)
+            blocks = []
+            if data["media"]:
+                lis = "".join(
+                    f"<li><a href='{_watch_url(r['kind'], r['id'])}'>"
+                    f"{html.escape(r['title_guess'])}</a> "
+                    f"<span class='kind'>{r['kind']} · {html.escape(r['library'])}</span></li>"
+                    for r in data["media"]
+                )
+                blocks.append(f"<h3>Media</h3><ul class='media'>{lis}</ul>")
+            if data["episodes"]:
+                lis = "".join(
+                    f"<li><a href='/watch/episode/{r['id']}'>"
+                    f"{html.escape(r['show_title'])} S{r['season']:02d}E{r['episode']:02d}"
+                    f" &mdash; {html.escape(r['title_guess'] or '')}</a></li>"
+                    for r in data["episodes"]
+                )
+                blocks.append(f"<h3>Episodes</h3><ul class='episodes'>{lis}</ul>")
+            if not blocks:
+                blocks.append("<p class='empty'>No matches.</p>")
+            results_html = "".join(blocks)
+        body = f"""
+<h2>Search</h2>
+<form method='get' action='/search' class='search'>
+  <input name='q' value='{html.escape(q)}' placeholder='Title or episode keyword' autofocus>
+  <button type='submit'>Search</button>
+</form>
+{results_html}
+"""
+        return _page("Search", body, user=user)
+
+    # --- Continue Watching ----------------------------------------------
+
+    @app.get("/api/continue-watching")
+    def api_continue_watching(request: Request, limit: int = 20):
+        user = _require_user(request)
+        conn = _conn()
+        media_rows = conn.execute(
+            """
+            SELECT m.id, m.kind, m.title_guess, mp.position_seconds,
+                   mp.duration_seconds, mp.updated_at
+            FROM media_progress mp
+            JOIN media m ON m.id = mp.media_id
+            WHERE mp.user_id = ? AND mp.position_seconds > 0
+            ORDER BY mp.updated_at DESC LIMIT ?
+            """,
+            (user["id"], limit),
+        ).fetchall()
+        episode_rows = conn.execute(
+            """
+            SELECT e.id, e.season, e.episode, e.title_guess AS ep_title,
+                   m.id AS show_id, m.title_guess AS show_title,
+                   ep.position_seconds, ep.duration_seconds, ep.updated_at
+            FROM episode_progress ep
+            JOIN tv_episodes e ON e.id = ep.episode_id
+            JOIN media m ON m.id = e.show_id
+            WHERE ep.user_id = ? AND ep.position_seconds > 0
+            ORDER BY ep.updated_at DESC LIMIT ?
+            """,
+            (user["id"], limit),
+        ).fetchall()
+        book_rows = conn.execute(
+            """
+            SELECT m.id, m.title_guess, ap.current_track_id,
+                   ap.position_seconds, ap.updated_at
+            FROM audiobook_progress ap
+            JOIN media m ON m.id = ap.book_id
+            WHERE ap.user_id = ? AND (ap.position_seconds > 0 OR ap.current_track_id IS NOT NULL)
+            ORDER BY ap.updated_at DESC LIMIT ?
+            """,
+            (user["id"], limit),
+        ).fetchall()
+        return {
+            "media": [dict(r) for r in media_rows],
+            "episodes": [dict(r) for r in episode_rows],
+            "audiobooks": [dict(r) for r in book_rows],
+        }
+
+    @app.get("/continue-watching", response_class=HTMLResponse)
+    def page_continue_watching(request: Request):
+        user = _require_user(request)
+        data = api_continue_watching(request)
+        blocks = []
+        if data["media"]:
+            lis = "".join(
+                f"<li><a href='{_watch_url(r['kind'], r['id'])}'>"
+                f"{html.escape(r['title_guess'])}</a> "
+                f"<span class='kind'>{_progress_label(r)}</span></li>"
+                for r in data["media"]
+            )
+            blocks.append(f"<h3>Movies / books</h3><ul class='media'>{lis}</ul>")
+        if data["episodes"]:
+            lis = "".join(
+                f"<li><a href='/watch/episode/{r['id']}'>"
+                f"{html.escape(r['show_title'])} S{r['season']:02d}E{r['episode']:02d}"
+                f"</a> <span class='kind'>{_progress_label(r)}</span></li>"
+                for r in data["episodes"]
+            )
+            blocks.append(f"<h3>TV episodes</h3><ul class='episodes'>{lis}</ul>")
+        if data["audiobooks"]:
+            lis = "".join(
+                f"<li><a href='/book/{r['id']}'>{html.escape(r['title_guess'])}</a></li>"
+                for r in data["audiobooks"]
+            )
+            blocks.append(f"<h3>Audiobooks</h3><ul class='media'>{lis}</ul>")
+        if not blocks:
+            body = "<h2>Continue Watching</h2><p class='empty'>Nothing in progress yet.</p>"
+        else:
+            body = "<h2>Continue Watching</h2>" + "".join(blocks)
+        return _page("Continue Watching", body, user=user)
+
     return app
 
 
@@ -1198,7 +1382,25 @@ table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .status-running { color: #fc6; }
 .status-done    { color: #6c6; }
 .status-failed  { color: #f66; }
+form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
+form.search input { flex: 1; padding: .4rem .5rem; background: #222;
+                     color: #eee; border: 1px solid #333; border-radius: 3px; font: inherit; }
+form.search button { padding: .4rem .8rem; background: #245; color: #eee;
+                      border: 1px solid #468; border-radius: 3px; cursor: pointer; }
+nav.top { display: flex; gap: 1rem; margin-bottom: 1rem; font-size: .9em; }
 """
+
+
+def _progress_label(row: dict) -> str:
+    """Format a 'mm:ss / mm:ss' style progress label for continue-watching."""
+    pos = row.get("position_seconds") or 0
+    dur = row.get("duration_seconds")
+    pos_s = f"{int(pos // 60)}:{int(pos % 60):02d}"
+    if dur:
+        dur_s = f"{int(dur // 60)}:{int(dur % 60):02d}"
+        pct = int(min(100, (pos / dur) * 100)) if dur else 0
+        return f"{pos_s} / {dur_s} ({pct}%)"
+    return pos_s
 
 
 def _human_size(n: Optional[int]) -> str:
@@ -1260,8 +1462,16 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
             + " · <form method='post' action='/logout'><button>Log out</button></form>"
             + "</span>"
         )
+        nav = (
+            "<nav class='top'>"
+            "<a href='/'>Libraries</a>"
+            "<a href='/continue-watching'>Continue Watching</a>"
+            "<a href='/search'>Search</a>"
+            "</nav>"
+        )
     else:
         userbar = "<span class='userbar'><a href='/login'>Log in</a> · <a href='/register'>Register</a></span>"
+        nav = "<nav class='top'><a href='/'>Libraries</a><a href='/search'>Search</a></nav>"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1275,6 +1485,7 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
   <h1><a href="/">Cuttlefish</a></h1>
   {userbar}
 </header>
+{nav}
 {body_html}
 </body>
 </html>
