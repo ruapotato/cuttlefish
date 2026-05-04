@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -131,6 +131,17 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         position_seconds REAL    NOT NULL DEFAULT 0,
         updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_id, book_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS encoded_episodes (
+        episode_id    INTEGER PRIMARY KEY REFERENCES tv_episodes(id) ON DELETE CASCADE,
+        clean_dir     TEXT    NOT NULL,
+        video_path    TEXT    NOT NULL,
+        subtitle_path TEXT,
+        poster_path   TEXT,
+        size_bytes    INTEGER,
+        encoded_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
 )

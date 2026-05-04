@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from cuttlefish import auth, db
+from cuttlefish import auth, cruft as cruft_mod, db
 from cuttlefish.clients.opensubtitles import OpenSubtitles
 from cuttlefish.clients.tmdb import TMDb
 from cuttlefish.server.streaming import stream_file, video_path_for_media
@@ -32,6 +32,10 @@ class ProgressBody(BaseModel):
 class AudiobookProgressBody(BaseModel):
     track_id: int
     position_seconds: float = Field(..., ge=0)
+
+
+class CruftDeleteBody(BaseModel):
+    path: str
 
 
 # --- app factory ----------------------------------------------------------
@@ -525,6 +529,56 @@ def create_app(
             )
         return {"ok": True, "job_id": cur.lastrowid}
 
+    @app.post("/api/admin/encode/episode/{episode_id}")
+    def api_admin_enqueue_episode_encode(episode_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM tv_episodes WHERE id = ?", (episode_id,)).fetchone() is None:
+            raise HTTPException(404, "episode not found")
+        job_id = encoder.enqueue_episode_encode(conn, episode_id)
+        return {"ok": True, "job_id": job_id}
+
+    # --- Admin: cruft -----------------------------------------------------
+
+    @app.get("/api/admin/cruft")
+    def api_admin_list_cruft(request: Request, library_id: Optional[int] = None):
+        _require_admin(request)
+        conn = _conn()
+        lib_ids: list[int]
+        if library_id is not None:
+            lib_ids = [library_id]
+        else:
+            lib_ids = [r["id"] for r in conn.execute("SELECT id FROM libraries").fetchall()]
+        out: list[dict] = []
+        for lid in lib_ids:
+            for entry in cruft_mod.list_cruft(conn, lid):
+                out.append(
+                    {
+                        "library_id": lid,
+                        "path": str(entry.path),
+                        "size_bytes": entry.size_bytes,
+                        "reason": entry.reason,
+                    }
+                )
+        return out
+
+    @app.post("/api/admin/cruft/delete")
+    def api_admin_delete_cruft(body: CruftDeleteBody, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        path = Path(body.path)
+        if not cruft_mod.is_path_inside_a_library(conn, path):
+            raise HTTPException(403, "path is not inside a registered library")
+        if not path.is_file():
+            raise HTTPException(404, "file not found")
+        # Don't accidentally delete a media file via the cruft endpoint.
+        ext = path.suffix.lower()
+        from cuttlefish.scanner import AUDIO_EXTS, VIDEO_EXTS
+        if ext in VIDEO_EXTS or ext in AUDIO_EXTS:
+            raise HTTPException(409, "refusing to delete a media file via the cruft endpoint")
+        path.unlink()
+        return {"ok": True, "deleted": str(path)}
+
     # --- Admin HTML pages -----------------------------------------------
 
     @app.get("/admin", response_class=HTMLResponse)
@@ -546,6 +600,7 @@ def create_app(
   <li><a href='/admin/encode'>Encode media</a> — {counts['media'] - counts['encoded']} not yet encoded</li>
   <li><a href='/admin/jobs'>Jobs</a> — {counts['queued']} queued, {counts['running']} running, {counts['failed']} failed</li>
   <li><a href='/admin/cleanup'>Cleanup originals</a> — manual delete after re-encode</li>
+  <li><a href='/admin/cruft'>Cruft</a> — non-media files that may be safe to delete</li>
 </ul>
 """
         return _page("Admin", body, user=user)
@@ -687,6 +742,70 @@ def create_app(
             raise HTTPException(404, "media not found")
         encoder.enqueue_encode(conn, media_id)
         return RedirectResponse("/admin/jobs", status_code=303)
+
+    @app.get("/admin/cruft", response_class=HTMLResponse)
+    def page_admin_cruft(request: Request):
+        user = _require_admin(request)
+        conn = _conn()
+        libs = conn.execute("SELECT id, name FROM libraries ORDER BY id").fetchall()
+        sections = []
+        total = 0
+        for lib in libs:
+            entries = cruft_mod.list_cruft(conn, lib["id"])
+            if not entries:
+                continue
+            rows = "".join(
+                f"<tr>"
+                f"<td><code>{html.escape(str(e.path))}</code></td>"
+                f"<td><span class='size'>{_human_size(e.size_bytes)}</span></td>"
+                f"<td>{e.reason}</td>"
+                f"<td><form method='post' action='/admin/cruft/delete' "
+                f"onsubmit='return confirm(\"Delete {html.escape(e.path.name)}?\");'>"
+                f"<input type='hidden' name='path' value='{html.escape(str(e.path))}'>"
+                f"<button type='submit'>Delete</button></form></td>"
+                f"</tr>"
+                for e in entries
+            )
+            total += len(entries)
+            sections.append(
+                f"<h3>{html.escape(lib['name'])}</h3>"
+                "<table class='admin'><thead><tr>"
+                "<th>path</th><th>size</th><th>reason</th><th></th>"
+                "</tr></thead><tbody>"
+                f"{rows}</tbody></table>"
+            )
+        if not sections:
+            body = (
+                "<h2>Cruft</h2><p class='empty'>No cruft found in any library.</p>"
+                "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        else:
+            body = (
+                "<h2>Cruft</h2>"
+                f"<p class='hint'>{total} non-media file(s) found across your libraries. "
+                "These are files cuttlefish does not know what to do with — typically "
+                "<code>downloadedfrom.txt</code>, NFOs, sample files, or orphan "
+                "subtitles whose video disappeared. Delete only what you don't want.</p>"
+                + "".join(sections)
+                + "<p><a href='/admin'>&larr; Admin</a></p>"
+            )
+        return _page("Cruft", body, user=user)
+
+    @app.post("/admin/cruft/delete")
+    def page_admin_cruft_delete(request: Request, path: str = Form(...)):
+        _require_admin(request)
+        conn = _conn()
+        p = Path(path)
+        if not cruft_mod.is_path_inside_a_library(conn, p):
+            raise HTTPException(403, "path is not inside a registered library")
+        if not p.is_file():
+            return RedirectResponse("/admin/cruft", status_code=303)
+        ext = p.suffix.lower()
+        from cuttlefish.scanner import AUDIO_EXTS, VIDEO_EXTS
+        if ext in VIDEO_EXTS or ext in AUDIO_EXTS:
+            raise HTTPException(409, "refusing to delete a media file via cruft")
+        p.unlink()
+        return RedirectResponse("/admin/cruft", status_code=303)
 
     @app.post("/admin/originals/{media_id}/delete")
     def page_admin_delete_original(media_id: int, request: Request):

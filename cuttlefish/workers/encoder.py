@@ -220,6 +220,116 @@ def enqueue_encode(
     return cur.lastrowid
 
 
+def enqueue_episode_encode(
+    conn: sqlite3.Connection, episode_id: int, payload: Optional[dict] = None
+) -> int:
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO jobs (kind, episode_id, payload) VALUES ('encode', ?, ?)",
+            (episode_id, json.dumps(payload) if payload else None),
+        )
+    return cur.lastrowid
+
+
+def encode_episode(
+    conn: sqlite3.Connection,
+    episode_id: int,
+    ffmpeg: str = "ffmpeg",
+    overwrite: bool = False,
+) -> EncodeResult:
+    """Re-encode a single TV episode into <show_root>/Title/Season XX/SxxExx - <ep>.mp4
+
+    Originals are kept; the encoded file lives alongside in a sibling clean
+    folder (one per season).
+    """
+    row = conn.execute(
+        "SELECT e.source_path, e.season, e.episode, e.title_guess AS ep_title, "
+        "       m.title_guess AS show_title, m.source_path AS show_path "
+        "FROM tv_episodes e JOIN media m ON m.id = e.show_id "
+        "WHERE e.id = ?",
+        (episode_id,),
+    ).fetchone()
+    if row is None:
+        raise EncodeError(f"episode {episode_id} not found")
+    source_video = Path(row["source_path"])
+    if not source_video.is_file():
+        raise EncodeError(f"episode source missing: {source_video}")
+    show_dir = Path(row["show_path"])
+    safe_show = safe_dirname(row["show_title"])
+    season_dir_name = f"Season {row['season']:02d}"
+    ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
+    ep_title = (row["ep_title"] or "").strip()
+    base = f"{safe_show} - {ep_label}"
+    if ep_title and ep_title != row["show_title"]:
+        base = f"{safe_show} - {ep_label} - {safe_dirname(ep_title)[:80]}"
+    clean_dir = show_dir.parent / safe_show / season_dir_name
+    out_video = clean_dir / f"{base}.mp4"
+    if out_video.exists() and not overwrite:
+        raise EncodeError(f"output already exists: {out_video}")
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg, "-nostdin", "-y" if overwrite else "-n", "-i", str(source_video)]
+    cmd.extend(FFMPEG_ARGS)
+    cmd.append(str(out_video))
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        try:
+            out_video.unlink()
+        except FileNotFoundError:
+            pass
+        raise EncodeError(
+            f"ffmpeg failed (exit {proc.returncode}): {proc.stderr[-2000:]}"
+        )
+    if not out_video.is_file() or out_video.stat().st_size == 0:
+        raise EncodeError(f"ffmpeg produced no/empty output at {out_video}")
+
+    # Sidecars from source
+    poster_dst: Optional[Path] = None
+    sub_dst: Optional[Path] = None
+    poster_src = _find_sidecar(source_video, POSTER_EXTS)
+    if poster_src:
+        poster_dst = out_video.with_suffix(poster_src.suffix.lower())
+        if not poster_dst.exists():
+            shutil.copy2(poster_src, poster_dst)
+    sub_src = _find_sidecar(source_video, SUBTITLE_EXTS)
+    if sub_src:
+        sub_dst = out_video.with_suffix(sub_src.suffix.lower())
+        if not sub_dst.exists():
+            shutil.copy2(sub_src, sub_dst)
+
+    size_bytes = out_video.stat().st_size
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO encoded_episodes
+                (episode_id, clean_dir, video_path, subtitle_path, poster_path, size_bytes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(episode_id) DO UPDATE SET
+                clean_dir     = excluded.clean_dir,
+                video_path    = excluded.video_path,
+                subtitle_path = excluded.subtitle_path,
+                poster_path   = excluded.poster_path,
+                size_bytes    = excluded.size_bytes,
+                encoded_at    = CURRENT_TIMESTAMP
+            """,
+            (
+                episode_id,
+                str(clean_dir),
+                str(out_video),
+                str(sub_dst) if sub_dst else None,
+                str(poster_dst) if poster_dst else None,
+                size_bytes,
+            ),
+        )
+    return EncodeResult(
+        media_id=episode_id,  # repurposed: caller can disambiguate by job kind
+        clean_dir=clean_dir,
+        video_path=out_video,
+        poster_path=poster_dst,
+        subtitle_path=sub_dst,
+        size_bytes=size_bytes,
+    )
+
+
 def claim_next_job(conn: sqlite3.Connection, kind: str = "encode") -> Optional[dict]:
     with conn:
         row = conn.execute(
@@ -271,9 +381,17 @@ def run_worker(
                 return processed
             time.sleep(poll_interval)
             continue
-        log.info("processing job %s for media %s", job["id"], job["media_id"])
+        log.info(
+            "processing job %s (media=%s episode=%s)",
+            job["id"], job["media_id"], job["episode_id"],
+        )
         try:
-            result = encode_media(conn, job["media_id"], ffmpeg=ffmpeg)
+            if job["episode_id"]:
+                result = encode_episode(conn, job["episode_id"], ffmpeg=ffmpeg)
+            elif job["media_id"]:
+                result = encode_media(conn, job["media_id"], ffmpeg=ffmpeg)
+            else:
+                raise EncodeError("job has neither media_id nor episode_id")
             mark_done(
                 conn,
                 job["id"],

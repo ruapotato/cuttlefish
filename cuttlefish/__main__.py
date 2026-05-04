@@ -105,9 +105,41 @@ def cmd_list_media(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    import logging
+    import threading
+
     import uvicorn
 
     from cuttlefish.server import create_app
+    from cuttlefish.workers import asr, encoder
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.with_worker:
+        t = threading.Thread(
+            target=encoder.run_worker,
+            kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},
+            daemon=True,
+            name="encode-worker",
+        )
+        t.start()
+        print(f"started embedded encode worker (thread={t.name})", file=sys.stderr)
+    if args.with_asr_worker:
+        if not asr.is_available():
+            print(
+                "warning: --with-asr-worker requested but ASR deps are not installed; "
+                "skipping. Install with: uv sync --extra asr",
+                file=sys.stderr,
+            )
+        else:
+            t = threading.Thread(
+                target=asr.run_worker,
+                kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},
+                daemon=True,
+                name="asr-worker",
+            )
+            t.start()
+            print(f"started embedded ASR worker (thread={t.name})", file=sys.stderr)
 
     app = create_app(db_path=args.db)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -202,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("serve", help="Run the cuttlefish web server.")
     p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
+    p.add_argument("--with-worker", action="store_true",
+                   help="Also run the encode worker in a background thread.")
+    p.add_argument("--with-asr-worker", action="store_true",
+                   help="Also run the ASR worker in a background thread (needs [asr] extra).")
+    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path for embedded workers.")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("encode-worker", help="Run the encode worker loop.")
