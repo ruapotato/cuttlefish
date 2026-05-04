@@ -127,6 +127,25 @@ def cmd_encode_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_asr_worker(args: argparse.Namespace) -> int:
+    import logging
+
+    from cuttlefish.workers import asr
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not asr.is_available():
+        print(
+            "ASR dependencies not installed. Run: uv sync --extra asr",
+            file=sys.stderr,
+        )
+        return 2
+    n = asr.run_worker(
+        db_path=args.db, once=args.once, poll_interval=args.poll, ffmpeg=args.ffmpeg
+    )
+    print(f"processed {n} job(s)")
+    return 0
+
+
 def cmd_encode_now(args: argparse.Namespace) -> int:
     """Encode a single media item synchronously (no queue)."""
     import logging
@@ -196,6 +215,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path.")
     p.add_argument("--overwrite", action="store_true", help="Re-encode even if output exists.")
     p.set_defaults(func=cmd_encode_now)
+
+    p = sub.add_parser("asr-worker", help="Run the ASR (Parakeet) worker loop. Requires the [asr] extra.")
+    p.add_argument("--once", action="store_true", help="Process one job and exit.")
+    p.add_argument("--poll", type=float, default=5.0, help="Seconds between polls when idle.")
+    p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path.")
+    p.set_defaults(func=cmd_asr_worker)
 
     args = parser.parse_args(argv)
 

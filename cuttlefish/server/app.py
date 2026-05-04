@@ -15,6 +15,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from cuttlefish import auth, db
+from cuttlefish.clients.opensubtitles import OpenSubtitles
+from cuttlefish.clients.tmdb import TMDb
 from cuttlefish.server.streaming import stream_file, video_path_for_media
 from cuttlefish.workers import encoder
 
@@ -30,8 +32,27 @@ class ProgressBody(BaseModel):
 # --- app factory ----------------------------------------------------------
 
 
-def create_app(db_path: Optional[Path | str] = None) -> FastAPI:
+def create_app(
+    db_path: Optional[Path | str] = None,
+    tmdb_client: Optional[TMDb] = None,
+    opensubtitles_client: Optional[OpenSubtitles] = None,
+) -> FastAPI:
     app = FastAPI(title="Cuttlefish", version="0.0.0", docs_url="/api/docs")
+    # Lazily build clients; allow injection for testing.
+    _tmdb = tmdb_client
+    _opensubs = opensubtitles_client
+
+    def get_tmdb() -> TMDb:
+        nonlocal _tmdb
+        if _tmdb is None:
+            _tmdb = TMDb()
+        return _tmdb
+
+    def get_opensubtitles() -> OpenSubtitles:
+        nonlocal _opensubs
+        if _opensubs is None:
+            _opensubs = OpenSubtitles()
+        return _opensubs
 
     def _conn() -> sqlite3.Connection:
         return db.connect(db_path)
@@ -298,6 +319,103 @@ def create_app(db_path: Optional[Path | str] = None) -> FastAPI:
                 (str(video.parent), media_id),
             )
         return {"ok": True, "deleted": str(src)}
+
+    # --- Admin: external lookups ----------------------------------------
+
+    def _encoded_or_404(media_id: int):
+        row = _conn().execute(
+            "SELECT m.title_guess, m.kind, e.clean_dir, e.video_path "
+            "FROM media m JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE m.id = ?",
+            (media_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                409,
+                "media has no encoded version yet — run the encoder first so "
+                "we know where to write the metadata/subtitle",
+            )
+        return row
+
+    @app.post("/api/admin/metadata/{media_id}")
+    def api_admin_fetch_metadata(media_id: int, request: Request):
+        _require_admin(request)
+        client = get_tmdb()
+        if not client.configured:
+            raise HTTPException(
+                503,
+                "TMDb not configured: set TMDB_API_KEY in the environment",
+            )
+        row = _encoded_or_404(media_id)
+        kind = row["kind"]
+        searcher = client.search_movie if kind != "tv_show" else client.search_tv
+        results = searcher(row["title_guess"])
+        if not results:
+            return {"matched": False}
+        top = results[0]
+        clean_dir = Path(row["clean_dir"])
+        title = (top.get("title") or top.get("name") or "poster").replace("/", "_")
+        poster_dst = clean_dir / f"{Path(row['video_path']).stem}.jpg"
+        client.download_poster(top.get("poster_path"), poster_dst)
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE encoded_files SET poster_path = ? WHERE media_id = ?",
+                (str(poster_dst) if poster_dst.exists() else None, media_id),
+            )
+        return {
+            "matched": True,
+            "tmdb_id": top.get("id"),
+            "title": title,
+            "poster_path": str(poster_dst) if poster_dst.exists() else None,
+        }
+
+    @app.post("/api/admin/subtitle/{media_id}")
+    def api_admin_fetch_subtitle(media_id: int, request: Request, language: str = "en"):
+        _require_admin(request)
+        client = get_opensubtitles()
+        if not client.configured:
+            raise HTTPException(
+                503, "OpenSubtitles not configured: set OPENSUBTITLES_API_KEY"
+            )
+        row = _encoded_or_404(media_id)
+        results = client.search(row["title_guess"], languages=language)
+        if not results:
+            return {"matched": False}
+        # Pick the first result's first file id
+        files = results[0].get("attributes", {}).get("files", [])
+        if not files:
+            return {"matched": False}
+        file_id = files[0].get("file_id")
+        if not file_id:
+            return {"matched": False}
+        if not client.can_download:
+            raise HTTPException(
+                503,
+                "OpenSubtitles search succeeded but downloading needs "
+                "OPENSUBTITLES_USERNAME and OPENSUBTITLES_PASSWORD too",
+            )
+        clean_dir = Path(row["clean_dir"])
+        srt_dst = clean_dir / f"{Path(row['video_path']).stem}.srt"
+        client.download(file_id, srt_dst)
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE encoded_files SET subtitle_path = ? WHERE media_id = ?",
+                (str(srt_dst) if srt_dst.exists() else None, media_id),
+            )
+        return {
+            "matched": True,
+            "subtitle_path": str(srt_dst) if srt_dst.exists() else None,
+        }
+
+    @app.post("/api/admin/asr/{media_id}")
+    def api_admin_enqueue_asr(media_id: int, request: Request):
+        _require_admin(request)
+        _encoded_or_404(media_id)
+        with _conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (media_id,)
+            )
+        return {"ok": True, "job_id": cur.lastrowid}
 
     # --- HTML pages ------------------------------------------------------
 
