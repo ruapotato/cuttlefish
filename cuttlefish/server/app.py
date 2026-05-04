@@ -189,6 +189,44 @@ def create_app(
             raise HTTPException(404, "no subtitle available for this episode")
         return _serve_vtt(sub)
 
+    # --- Posters ---------------------------------------------------------
+
+    @app.get("/poster/{media_id}")
+    def poster_for_media(media_id: int):
+        from fastapi.responses import FileResponse
+        row = _conn().execute(
+            "SELECT m.poster_path, e.poster_path AS encoded_poster "
+            "FROM media m LEFT JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE m.id = ?",
+            (media_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "media not found")
+        for candidate in (row["encoded_poster"], row["poster_path"]):
+            if candidate:
+                p = Path(candidate)
+                if p.is_file():
+                    return FileResponse(p)
+        raise HTTPException(404, "no poster available")
+
+    @app.get("/poster/episode/{episode_id}")
+    def poster_for_episode(episode_id: int):
+        from fastapi.responses import FileResponse
+        row = _conn().execute(
+            "SELECT e.poster_path, ee.poster_path AS encoded_poster "
+            "FROM tv_episodes e LEFT JOIN encoded_episodes ee ON ee.episode_id = e.id "
+            "WHERE e.id = ?",
+            (episode_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "episode not found")
+        for candidate in (row["encoded_poster"], row["poster_path"]):
+            if candidate:
+                p = Path(candidate)
+                if p.is_file():
+                    return FileResponse(p)
+        raise HTTPException(404, "no poster available")
+
     # --- Auth API --------------------------------------------------------
 
     @app.post("/api/auth/register")
@@ -906,7 +944,7 @@ def create_app(
         if not lib:
             raise HTTPException(404, "library not found")
         media = conn.execute(
-            "SELECT id, kind, title_guess FROM media WHERE library_id = ? "
+            "SELECT id, kind, title_guess, poster_path FROM media WHERE library_id = ? "
             "ORDER BY title_guess",
             (library_id,),
         ).fetchall()
@@ -914,10 +952,13 @@ def create_app(
             body = "<p class='empty'>No media yet. Run <code>uv run cuttlefish scan</code>.</p>"
         else:
             items = "".join(
-                f"<li><a href='{_watch_url(m['kind'], m['id'])}'>{html.escape(m['title_guess'])}</a></li>"
+                f"<li class='card'><a href='{_watch_url(m['kind'], m['id'])}'>"
+                + (f"<img src='/poster/{m['id']}' alt=''>" if m['poster_path'] else "<div class='no-poster'></div>")
+                + f"<span class='card-title'>{html.escape(m['title_guess'])}</span>"
+                "</a></li>"
                 for m in media
             )
-            body = f"<ul class='media'>{items}</ul>"
+            body = f"<ul class='cards'>{items}</ul>"
         return _page(f"{lib['name']} ({lib['kind']})", body, user=user)
 
     @app.get("/watch/{media_id}", response_class=HTMLResponse)
@@ -955,18 +996,23 @@ def create_app(
         user = _current_user(request)
         conn = _conn()
         show = conn.execute(
-            "SELECT id, title_guess, kind FROM media WHERE id = ?", (show_id,)
+            "SELECT id, title_guess, kind, poster_path FROM media WHERE id = ?", (show_id,)
         ).fetchone()
         if not show or show["kind"] != "tv_show":
             raise HTTPException(404, "show not found")
         eps = conn.execute(
-            "SELECT id, season, episode, title_guess FROM tv_episodes "
+            "SELECT id, season, episode, title_guess, duration_seconds FROM tv_episodes "
             "WHERE show_id = ? ORDER BY season, episode, id",
             (show_id,),
         ).fetchall()
         title = html.escape(show["title_guess"])
+        poster_html = (
+            f"<img class='show-poster' src='/poster/{show_id}' alt=''>"
+            if show["poster_path"]
+            else ""
+        )
         if not eps:
-            body = f"<h2>{title}</h2><p class='empty'>No episodes scanned yet.</p>"
+            body = f"{poster_html}<h2>{title}</h2><p class='empty'>No episodes scanned yet.</p>"
         else:
             seasons: dict[int, list] = {}
             for e in eps:
@@ -975,12 +1021,15 @@ def create_app(
             for season, items in sorted(seasons.items()):
                 lis = "".join(
                     f"<li><a href='/watch/episode/{e['id']}'>"
-                    f"S{e['season']:02d}E{e['episode']:02d} &mdash; {html.escape(e['title_guess'] or '(untitled)')}"
-                    "</a></li>"
+                    f"S{e['season']:02d}E{e['episode']:02d} &mdash; "
+                    f"{html.escape(e['title_guess'] or '(untitled)')}</a>"
+                    + (f" <span class='kind'>{_format_duration(e['duration_seconds'])}</span>"
+                       if e['duration_seconds'] else "")
+                    + "</li>"
                     for e in items
                 )
                 sections.append(f"<h3>Season {season}</h3><ul class='episodes'>{lis}</ul>")
-            body = f"<h2>{title}</h2>" + "".join(sections) + "<p><a href='/'>&larr; Libraries</a></p>"
+            body = f"{poster_html}<h2>{title}</h2>" + "".join(sections) + "<p><a href='/'>&larr; Libraries</a></p>"
         return _page(title, body, user=user)
 
     @app.get("/watch/episode/{episode_id}", response_class=HTMLResponse)
@@ -1382,6 +1431,18 @@ table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .status-running { color: #fc6; }
 .status-done    { color: #6c6; }
 .status-failed  { color: #f66; }
+ul.cards { list-style: none; padding: 0; display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 1rem; }
+ul.cards li.card a { display: block; }
+ul.cards li.card img, ul.cards li.card .no-poster {
+    width: 100%; aspect-ratio: 2 / 3; object-fit: cover;
+    background: #222; border-radius: 4px; display: block;
+}
+ul.cards li.card .card-title { display: block; font-size: .9em; padding: .4rem 0;
+                                color: #eee; line-height: 1.2; }
+img.show-poster { max-width: 200px; max-height: 300px; float: right;
+                   margin: 0 0 1rem 1rem; border-radius: 4px; }
 form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
 form.search input { flex: 1; padding: .4rem .5rem; background: #222;
                      color: #eee; border: 1px solid #333; border-radius: 3px; font: inherit; }
@@ -1389,6 +1450,17 @@ form.search button { padding: .4rem .8rem; background: #245; color: #eee;
                       border: 1px solid #468; border-radius: 3px; cursor: pointer; }
 nav.top { display: flex; gap: 1rem; margin-bottom: 1rem; font-size: .9em; }
 """
+
+
+def _format_duration(seconds: Optional[float]) -> str:
+    if not seconds:
+        return ""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m {sec:02d}s"
 
 
 def _progress_label(row: dict) -> str:

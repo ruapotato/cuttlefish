@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -162,10 +162,27 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Idempotent additive ALTER TABLE migrations for DBs created on an older
+# SCHEMA_VERSION. SQLite's ALTER TABLE ADD COLUMN raises OperationalError
+# when the column already exists, which we swallow.
+ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("media", "duration_seconds REAL"),
+    ("media", "poster_path TEXT"),
+    ("tv_episodes", "duration_seconds REAL"),
+    ("tv_episodes", "poster_path TEXT"),
+    ("audiobook_tracks", "duration_seconds REAL"),
+)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     with conn:
         for stmt in SCHEMA_STATEMENTS:
             conn.execute(stmt)
+        for table, col_decl in ADDITIVE_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_decl}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),
