@@ -49,9 +49,21 @@ class ServerSettings:
 
 
 @dataclass
+class TLSSettings:
+    enabled: bool = False
+    domain: Optional[str] = None
+    email: Optional[str] = None
+    dns_provider: Optional[str] = None
+    dns_credentials_file: Optional[Path] = None
+    cert_dir: Optional[Path] = None
+    renewal_window_days: int = 30
+
+
+@dataclass
 class Config:
     db: Optional[Path] = None
     server: ServerSettings = field(default_factory=ServerSettings)
+    tls: TLSSettings = field(default_factory=TLSSettings)
     libraries: list[LibraryEntry] = field(default_factory=list)
 
     @classmethod
@@ -70,6 +82,19 @@ class Config:
         cfg.server.with_worker = bool(srv.get("with_worker", cfg.server.with_worker))
         cfg.server.with_asr_worker = bool(srv.get("with_asr_worker", cfg.server.with_asr_worker))
         cfg.server.ffmpeg = str(srv.get("ffmpeg", cfg.server.ffmpeg))
+        tls = data.get("tls", {}) or {}
+        cfg.tls.enabled = bool(tls.get("enabled", False))
+        if cfg.tls.enabled:
+            for required in ("domain", "email", "dns_provider",
+                             "dns_credentials_file", "cert_dir"):
+                if not tls.get(required):
+                    raise ValueError(f"[tls] enabled but missing {required!r}")
+            cfg.tls.domain = tls["domain"]
+            cfg.tls.email = tls["email"]
+            cfg.tls.dns_provider = tls["dns_provider"]
+            cfg.tls.dns_credentials_file = Path(tls["dns_credentials_file"]).expanduser()
+            cfg.tls.cert_dir = Path(tls["cert_dir"]).expanduser()
+            cfg.tls.renewal_window_days = int(tls.get("renewal_window_days", 30))
         for entry in data.get("library", []) or []:
             name = entry.get("name")
             kind = entry.get("kind")

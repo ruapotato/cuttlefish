@@ -170,8 +170,32 @@ def cmd_serve(args: argparse.Namespace) -> int:
             t.start()
             print(f"started embedded ASR worker (thread={t.name})", file=sys.stderr)
 
+    # TLS provisioning if enabled in config
+    ssl_kwargs: dict = {}
+    if args.config:
+        cfg = cfg_mod.load_or_die(args.config)
+        if cfg.tls.enabled:
+            from cuttlefish import tls as tls_mod
+            tls_cfg = tls_mod.TLSConfig(
+                domain=cfg.tls.domain,
+                email=cfg.tls.email,
+                dns_provider=cfg.tls.dns_provider,
+                dns_credentials_file=cfg.tls.dns_credentials_file,
+                cert_dir=cfg.tls.cert_dir,
+                renewal_window_days=cfg.tls.renewal_window_days,
+            )
+            cert, key = tls_mod.ensure_cert(tls_cfg)
+            ssl_kwargs = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+            # Background renewal loop
+            renewal_t = threading.Thread(
+                target=tls_mod.renewal_loop,
+                args=(tls_cfg,),
+                daemon=True, name="tls-renewal",
+            )
+            renewal_t.start()
+
     app = create_app(db_path=args.db)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", **ssl_kwargs)
     return 0
 
 

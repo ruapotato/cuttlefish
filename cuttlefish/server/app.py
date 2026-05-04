@@ -342,6 +342,40 @@ def create_app(
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @app.delete("/api/progress/{media_id}")
+    def api_delete_progress(media_id: int, request: Request):
+        user = _require_user(request)
+        with _conn() as conn:
+            conn.execute(
+                "DELETE FROM media_progress WHERE user_id = ? AND media_id = ?",
+                (user["id"], media_id),
+            )
+        return {"ok": True}
+
+    @app.post("/api/progress/{media_id}/watched")
+    def api_mark_watched(media_id: int, request: Request):
+        user = _require_user(request)
+        conn = _conn()
+        row = conn.execute(
+            "SELECT duration_seconds FROM media WHERE id = ?", (media_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "media not found")
+        duration = row["duration_seconds"] or 0
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO media_progress (user_id, media_id, position_seconds, duration_seconds, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, media_id) DO UPDATE SET
+                    position_seconds = excluded.position_seconds,
+                    duration_seconds = COALESCE(excluded.duration_seconds, media_progress.duration_seconds),
+                    updated_at       = CURRENT_TIMESTAMP
+                """,
+                (user["id"], media_id, duration, duration if duration > 0 else None),
+            )
+        return {"ok": True, "position_seconds": duration}
+
     @app.put("/api/progress/episode/{episode_id}")
     def api_put_episode_progress(episode_id: int, body: ProgressBody, request: Request):
         user = _require_user(request)
@@ -376,6 +410,16 @@ def create_app(
         if not row:
             return {"position_seconds": 0.0, "duration_seconds": None, "updated_at": None}
         return dict(row)
+
+    @app.delete("/api/progress/episode/{episode_id}")
+    def api_delete_episode_progress(episode_id: int, request: Request):
+        user = _require_user(request)
+        with _conn() as conn:
+            conn.execute(
+                "DELETE FROM episode_progress WHERE user_id = ? AND episode_id = ?",
+                (user["id"], episode_id),
+            )
+        return {"ok": True}
 
     @app.put("/api/progress/book/{book_id}")
     def api_put_book_progress(book_id: int, body: AudiobookProgressBody, request: Request):
@@ -1709,7 +1753,8 @@ def create_app(
             lis = "".join(
                 f"<li><a href='{_watch_url(r['kind'], r['id'])}'>"
                 f"{html.escape(r['title_guess'])}</a> "
-                f"<span class='kind'>{_progress_label(r)}</span></li>"
+                f"<span class='kind'>{_progress_label(r)}</span> "
+                f"{_progress_actions(r['id'], 'media')}</li>"
                 for r in data["media"]
             )
             blocks.append(f"<h3>Movies / books</h3><ul class='media'>{lis}</ul>")
@@ -1717,7 +1762,8 @@ def create_app(
             lis = "".join(
                 f"<li><a href='/watch/episode/{r['id']}'>"
                 f"{html.escape(r['show_title'])} S{r['season']:02d}E{r['episode']:02d}"
-                f"</a> <span class='kind'>{_progress_label(r)}</span></li>"
+                f"</a> <span class='kind'>{_progress_label(r)}</span> "
+                f"{_progress_actions(r['id'], 'episode')}</li>"
                 for r in data["episodes"]
             )
             blocks.append(f"<h3>TV episodes</h3><ul class='episodes'>{lis}</ul>")
@@ -1732,6 +1778,31 @@ def create_app(
         else:
             body = "<h2>Continue Watching</h2>" + "".join(blocks)
         return _page("Continue Watching", body, user=user)
+
+    @app.post("/progress/{media_id}/reset")
+    def page_reset_progress(media_id: int, request: Request):
+        user = _require_user(request)
+        with _conn() as conn:
+            conn.execute(
+                "DELETE FROM media_progress WHERE user_id = ? AND media_id = ?",
+                (user["id"], media_id),
+            )
+        return RedirectResponse("/continue-watching", status_code=303)
+
+    @app.post("/progress/{media_id}/watched")
+    def page_mark_watched(media_id: int, request: Request):
+        api_mark_watched(media_id, request)
+        return RedirectResponse("/continue-watching", status_code=303)
+
+    @app.post("/progress/episode/{episode_id}/reset")
+    def page_reset_episode_progress(episode_id: int, request: Request):
+        user = _require_user(request)
+        with _conn() as conn:
+            conn.execute(
+                "DELETE FROM episode_progress WHERE user_id = ? AND episode_id = ?",
+                (user["id"], episode_id),
+            )
+        return RedirectResponse("/continue-watching", status_code=303)
 
     return app
 
@@ -1798,6 +1869,22 @@ form.search button { padding: .4rem .8rem; background: #245; color: #eee;
                       border: 1px solid #468; border-radius: 3px; cursor: pointer; }
 nav.top { display: flex; gap: 1rem; margin-bottom: 1rem; font-size: .9em; }
 """
+
+
+def _progress_actions(item_id: int, kind: str) -> str:
+    """Inline forms for 'mark watched' and 'reset' next to a continue-watching row."""
+    base = f"/progress/{item_id}" if kind == "media" else f"/progress/episode/{item_id}"
+    watched = (
+        f"<form method='post' action='{base}/watched' style='display:inline'>"
+        "<button type='submit'>Mark watched</button></form>"
+        if kind == "media"
+        else ""
+    )
+    reset = (
+        f"<form method='post' action='{base}/reset' style='display:inline'>"
+        "<button type='submit'>Reset</button></form>"
+    )
+    return f"<span class='actions'>{watched} {reset}</span>"
 
 
 def _format_duration(seconds: Optional[float]) -> str:
