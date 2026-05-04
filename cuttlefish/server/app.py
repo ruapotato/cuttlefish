@@ -123,11 +123,17 @@ def create_app(
 
     @app.get("/stream/{media_id}")
     def stream(media_id: int, request: Request):
+        # Prefer the encoded version if one exists; fall back to source.
         row = _conn().execute(
-            "SELECT source_path FROM media WHERE id = ?", (media_id,)
+            "SELECT m.source_path, e.video_path FROM media m "
+            "LEFT JOIN encoded_files e ON e.media_id = m.id WHERE m.id = ?",
+            (media_id,),
         ).fetchone()
         if not row:
             raise HTTPException(404, "media not found")
+        encoded = row["video_path"]
+        if encoded and Path(encoded).is_file():
+            return stream_file(Path(encoded), request)
         path = video_path_for_media(Path(row["source_path"]))
         return stream_file(path, request)
 
