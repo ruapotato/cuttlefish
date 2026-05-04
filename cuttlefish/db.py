@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -123,6 +123,16 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(kind, status, id)",
+    """
+    CREATE TABLE IF NOT EXISTS audiobook_progress (
+        user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        book_id          INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+        current_track_id INTEGER REFERENCES audiobook_tracks(id) ON DELETE SET NULL,
+        position_seconds REAL    NOT NULL DEFAULT 0,
+        updated_at       TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, book_id)
+    )
+    """,
 )
 
 

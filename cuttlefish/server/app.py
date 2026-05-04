@@ -29,6 +29,11 @@ class ProgressBody(BaseModel):
     duration_seconds: Optional[float] = Field(None, ge=0)
 
 
+class AudiobookProgressBody(BaseModel):
+    track_id: int
+    position_seconds: float = Field(..., ge=0)
+
+
 # --- app factory ----------------------------------------------------------
 
 
@@ -137,6 +142,24 @@ def create_app(
         path = video_path_for_media(Path(row["source_path"]))
         return stream_file(path, request)
 
+    @app.get("/stream/episode/{episode_id}")
+    def stream_episode(episode_id: int, request: Request):
+        row = _conn().execute(
+            "SELECT source_path FROM tv_episodes WHERE id = ?", (episode_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "episode not found")
+        return stream_file(Path(row["source_path"]), request)
+
+    @app.get("/stream/track/{track_id}")
+    def stream_track(track_id: int, request: Request):
+        row = _conn().execute(
+            "SELECT source_path FROM audiobook_tracks WHERE id = ?", (track_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "track not found")
+        return stream_file(Path(row["source_path"]), request)
+
     # --- Auth API --------------------------------------------------------
 
     @app.post("/api/auth/register")
@@ -240,6 +263,85 @@ def create_app(
             (user["id"],),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    @app.put("/api/progress/episode/{episode_id}")
+    def api_put_episode_progress(episode_id: int, body: ProgressBody, request: Request):
+        user = _require_user(request)
+        conn = _conn()
+        if conn.execute(
+            "SELECT 1 FROM tv_episodes WHERE id = ?", (episode_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "episode not found")
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO episode_progress
+                    (user_id, episode_id, position_seconds, duration_seconds, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, episode_id) DO UPDATE SET
+                    position_seconds = excluded.position_seconds,
+                    duration_seconds = COALESCE(excluded.duration_seconds, episode_progress.duration_seconds),
+                    updated_at       = CURRENT_TIMESTAMP
+                """,
+                (user["id"], episode_id, body.position_seconds, body.duration_seconds),
+            )
+        return {"ok": True}
+
+    @app.get("/api/progress/episode/{episode_id}")
+    def api_get_episode_progress(episode_id: int, request: Request):
+        user = _require_user(request)
+        row = _conn().execute(
+            "SELECT position_seconds, duration_seconds, updated_at "
+            "FROM episode_progress WHERE user_id = ? AND episode_id = ?",
+            (user["id"], episode_id),
+        ).fetchone()
+        if not row:
+            return {"position_seconds": 0.0, "duration_seconds": None, "updated_at": None}
+        return dict(row)
+
+    @app.put("/api/progress/book/{book_id}")
+    def api_put_book_progress(book_id: int, body: AudiobookProgressBody, request: Request):
+        user = _require_user(request)
+        conn = _conn()
+        # Validate book + track relationship
+        row = conn.execute(
+            "SELECT m.id FROM media m WHERE m.id = ? AND m.kind = 'audiobook'",
+            (book_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "audiobook not found")
+        track_row = conn.execute(
+            "SELECT id FROM audiobook_tracks WHERE id = ? AND book_id = ?",
+            (body.track_id, book_id),
+        ).fetchone()
+        if track_row is None:
+            raise HTTPException(404, "track not in this book")
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO audiobook_progress
+                    (user_id, book_id, current_track_id, position_seconds, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, book_id) DO UPDATE SET
+                    current_track_id = excluded.current_track_id,
+                    position_seconds = excluded.position_seconds,
+                    updated_at       = CURRENT_TIMESTAMP
+                """,
+                (user["id"], book_id, body.track_id, body.position_seconds),
+            )
+        return {"ok": True}
+
+    @app.get("/api/progress/book/{book_id}")
+    def api_get_book_progress(book_id: int, request: Request):
+        user = _require_user(request)
+        row = _conn().execute(
+            "SELECT current_track_id, position_seconds, updated_at "
+            "FROM audiobook_progress WHERE user_id = ? AND book_id = ?",
+            (user["id"], book_id),
+        ).fetchone()
+        if not row:
+            return {"current_track_id": None, "position_seconds": 0.0, "updated_at": None}
+        return dict(row)
 
     # --- Admin: encoding + cleanup ---------------------------------------
 
@@ -457,7 +559,7 @@ def create_app(
         if not lib:
             raise HTTPException(404, "library not found")
         media = conn.execute(
-            "SELECT id, title_guess FROM media WHERE library_id = ? "
+            "SELECT id, kind, title_guess FROM media WHERE library_id = ? "
             "ORDER BY title_guess",
             (library_id,),
         ).fetchall()
@@ -465,7 +567,7 @@ def create_app(
             body = "<p class='empty'>No media yet. Run <code>uv run cuttlefish scan</code>.</p>"
         else:
             items = "".join(
-                f"<li><a href='/watch/{m['id']}'>{html.escape(m['title_guess'])}</a></li>"
+                f"<li><a href='{_watch_url(m['kind'], m['id'])}'>{html.escape(m['title_guess'])}</a></li>"
                 for m in media
             )
             body = f"<ul class='media'>{items}</ul>"
@@ -473,38 +575,166 @@ def create_app(
 
     @app.get("/watch/{media_id}", response_class=HTMLResponse)
     def page_watch(media_id: int, request: Request):
+        """Movie player. Shows redirect to /show, audiobooks to /book."""
         user = _current_user(request)
         row = _conn().execute(
             "SELECT id, title_guess, kind FROM media WHERE id = ?", (media_id,)
         ).fetchone()
         if not row:
             raise HTTPException(404, "media not found")
+        if row["kind"] == "tv_show":
+            return RedirectResponse(f"/show/{media_id}", status_code=303)
+        if row["kind"] == "audiobook":
+            return RedirectResponse(f"/book/{media_id}", status_code=303)
         title = html.escape(row["title_guess"])
-        tag = "audio" if row["kind"] == "audiobook" else "video"
-        # Embed a tiny progress-tracker that resumes + saves position when the
-        # viewer is logged in. If not logged in, the JS below silently no-ops.
-        progress_js = (
-            "<script>(function(){"
-            f"var el=document.getElementById('player');var mid={media_id};"
-            "var loaded=false;"
-            "fetch('/api/progress/'+mid).then(function(r){if(!r.ok)return null;return r.json();}).then(function(p){"
-            "  if(!p||!p.position_seconds)return;"
-            "  el.addEventListener('loadedmetadata',function(){if(loaded)return;loaded=true;el.currentTime=p.position_seconds;});"
-            "});"
-            "var last=0;"
-            "el.addEventListener('timeupdate',function(){"
-            "  var t=el.currentTime;if(Math.abs(t-last)<5)return;last=t;"
-            "  fetch('/api/progress/'+mid,{method:'PUT',headers:{'Content-Type':'application/json'},"
-            "    body:JSON.stringify({position_seconds:t,duration_seconds:el.duration||null})});"
-            "});})();</script>"
-        )
         body = (
             f"<h2>{title}</h2>"
-            f"<{tag} id='player' controls preload='metadata' src='/stream/{media_id}'>"
-            f"Your browser does not support the {tag} element.</{tag}>"
+            f"<video id='player' controls preload='metadata' src='/stream/{media_id}'>"
+            "Your browser does not support the video element.</video>"
             "<p><a href='/'>&larr; Libraries</a></p>"
-            + progress_js
+            + _player_progress_js(f"/api/progress/{media_id}")
         )
+        return _page(title, body, user=user)
+
+    @app.get("/show/{show_id}", response_class=HTMLResponse)
+    def page_show(show_id: int, request: Request):
+        user = _current_user(request)
+        conn = _conn()
+        show = conn.execute(
+            "SELECT id, title_guess, kind FROM media WHERE id = ?", (show_id,)
+        ).fetchone()
+        if not show or show["kind"] != "tv_show":
+            raise HTTPException(404, "show not found")
+        eps = conn.execute(
+            "SELECT id, season, episode, title_guess FROM tv_episodes "
+            "WHERE show_id = ? ORDER BY season, episode, id",
+            (show_id,),
+        ).fetchall()
+        title = html.escape(show["title_guess"])
+        if not eps:
+            body = f"<h2>{title}</h2><p class='empty'>No episodes scanned yet.</p>"
+        else:
+            seasons: dict[int, list] = {}
+            for e in eps:
+                seasons.setdefault(e["season"], []).append(e)
+            sections = []
+            for season, items in sorted(seasons.items()):
+                lis = "".join(
+                    f"<li><a href='/watch/episode/{e['id']}'>"
+                    f"S{e['season']:02d}E{e['episode']:02d} &mdash; {html.escape(e['title_guess'] or '(untitled)')}"
+                    "</a></li>"
+                    for e in items
+                )
+                sections.append(f"<h3>Season {season}</h3><ul class='episodes'>{lis}</ul>")
+            body = f"<h2>{title}</h2>" + "".join(sections) + "<p><a href='/'>&larr; Libraries</a></p>"
+        return _page(title, body, user=user)
+
+    @app.get("/watch/episode/{episode_id}", response_class=HTMLResponse)
+    def page_watch_episode(episode_id: int, request: Request):
+        user = _current_user(request)
+        row = _conn().execute(
+            "SELECT e.id, e.season, e.episode, e.title_guess, e.show_id, m.title_guess AS show_title "
+            "FROM tv_episodes e JOIN media m ON m.id = e.show_id WHERE e.id = ?",
+            (episode_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "episode not found")
+        ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
+        title = f"{row['show_title']} {ep_label}"
+        body = (
+            f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
+            f"<p>{html.escape(row['title_guess'] or '')}</p>"
+            f"<video id='player' controls preload='metadata' src='/stream/episode/{episode_id}'>"
+            "Your browser does not support the video element.</video>"
+            f"<p><a href='/show/{row['show_id']}'>&larr; All episodes</a></p>"
+            + _player_progress_js(f"/api/progress/episode/{episode_id}")
+        )
+        return _page(title, body, user=user)
+
+    @app.get("/book/{book_id}", response_class=HTMLResponse)
+    def page_book(book_id: int, request: Request):
+        user = _current_user(request)
+        conn = _conn()
+        book = conn.execute(
+            "SELECT id, title_guess, kind FROM media WHERE id = ?", (book_id,)
+        ).fetchone()
+        if not book or book["kind"] != "audiobook":
+            raise HTTPException(404, "audiobook not found")
+        tracks = conn.execute(
+            "SELECT id, order_index, source_path FROM audiobook_tracks "
+            "WHERE book_id = ? ORDER BY order_index",
+            (book_id,),
+        ).fetchall()
+        title = html.escape(book["title_guess"])
+        if not tracks:
+            return _page(title, f"<h2>{title}</h2><p class='empty'>No tracks scanned.</p>", user=user)
+        # Build a JS playlist that auto-advances.
+        playlist_json = (
+            "[" + ",".join(
+                "{"
+                f"\"id\":{t['id']},\"label\":\"{html.escape(Path(t['source_path']).name)}\""
+                "}"
+                for t in tracks
+            ) + "]"
+        )
+        chapter_lis = "".join(
+            f"<li data-track-id='{t['id']}'>"
+            f"<button type='button' class='ch'>{t['order_index']+1}. "
+            f"{html.escape(Path(t['source_path']).name)}</button></li>"
+            for t in tracks
+        )
+        body = f"""
+<h2>{title}</h2>
+<audio id='player' controls preload='metadata'></audio>
+<p id='now-playing' class='hint'>Loading...</p>
+<ol class='chapters'>{chapter_lis}</ol>
+<p><a href='/'>&larr; Libraries</a></p>
+<script>(function(){{
+  var playlist = {playlist_json};
+  var book_id = {book_id};
+  var el = document.getElementById('player');
+  var nowPlaying = document.getElementById('now-playing');
+  var idx = 0;
+  function load(i){{
+    if(i<0||i>=playlist.length) return;
+    idx = i;
+    var t = playlist[i];
+    el.src = '/stream/track/' + t.id;
+    nowPlaying.textContent = 'Chapter ' + (i+1) + ': ' + t.label;
+    document.querySelectorAll('.chapters li').forEach(function(li){{
+      li.classList.toggle('active', parseInt(li.dataset.trackId)===t.id);
+    }});
+  }}
+  function play(i){{ load(i); el.play().catch(function(){{}}); }}
+  document.querySelectorAll('.chapters .ch').forEach(function(btn,i){{
+    btn.addEventListener('click', function(){{ play(i); }});
+  }});
+  el.addEventListener('ended', function(){{
+    if(idx<playlist.length-1) play(idx+1);
+  }});
+  // Resume + save progress
+  fetch('/api/progress/book/' + book_id).then(function(r){{return r.ok?r.json():null;}}).then(function(p){{
+    if(!p||!p.current_track_id){{ load(0); return; }}
+    var i = playlist.findIndex(function(t){{return t.id===p.current_track_id;}});
+    if(i<0) i = 0;
+    load(i);
+    el.addEventListener('loadedmetadata', function once(){{
+      el.removeEventListener('loadedmetadata', once);
+      el.currentTime = p.position_seconds || 0;
+    }});
+  }});
+  var last = 0;
+  el.addEventListener('timeupdate', function(){{
+    var t = el.currentTime;
+    if(Math.abs(t-last)<5) return; last = t;
+    fetch('/api/progress/book/' + book_id, {{
+      method: 'PUT',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{track_id: playlist[idx].id, position_seconds: t}})
+    }});
+  }});
+}})();</script>
+"""
         return _page(title, body, user=user)
 
     @app.get("/login", response_class=HTMLResponse)
@@ -617,10 +847,17 @@ header form { display: inline; }
 header button { background: none; border: none; color: #6cf; cursor: pointer;
                 padding: 0; font: inherit; }
 header button:hover { text-decoration: underline; }
-ul.libraries, ul.media { list-style: none; padding: 0; }
-ul.libraries li, ul.media li { padding: .5rem 0; border-bottom: 1px solid #333; }
+ul.libraries, ul.media, ul.episodes, ol.chapters { list-style: none; padding: 0; }
+ul.libraries li, ul.media li, ul.episodes li, ol.chapters li {
+    padding: .4rem 0; border-bottom: 1px solid #222;
+}
+ol.chapters li.active button { color: #fc6; font-weight: bold; }
+ol.chapters button { background: none; border: none; color: #6cf;
+                      cursor: pointer; padding: 0; font: inherit; text-align: left; }
+ol.chapters button:hover { text-decoration: underline; }
 .kind { color: #888; font-size: .8em; margin-left: .5rem; }
 video, audio { width: 100%; max-height: 70vh; background: #000; }
+audio { max-height: 50px; }
 .empty, .hint { color: #888; }
 .error { color: #f66; }
 code { background: #222; padding: .15em .4em; border-radius: 3px; }
@@ -630,7 +867,40 @@ form.auth input { padding: .4rem .5rem; background: #222; color: #eee;
                    border: 1px solid #333; border-radius: 3px; font: inherit; }
 form.auth button { padding: .5rem; background: #245; color: #eee;
                     border: 1px solid #468; border-radius: 3px; cursor: pointer; }
+table.admin { width: 100%; border-collapse: collapse; }
+table.admin th, table.admin td { padding: .35rem .5rem;
+                                  border-bottom: 1px solid #222; text-align: left; }
+table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
+.size { color: #888; font-size: .85em; }
 """
+
+
+def _watch_url(kind: str, media_id: int) -> str:
+    if kind == "tv_show":
+        return f"/show/{media_id}"
+    if kind == "audiobook":
+        return f"/book/{media_id}"
+    return f"/watch/{media_id}"
+
+
+def _player_progress_js(progress_url: str) -> str:
+    """JS that resumes + saves position via the given progress endpoint."""
+    return (
+        "<script>(function(){"
+        "var el=document.getElementById('player');"
+        f"var url='{progress_url}';"
+        "var loaded=false;"
+        "fetch(url).then(function(r){return r.ok?r.json():null;}).then(function(p){"
+        "  if(!p||!p.position_seconds)return;"
+        "  el.addEventListener('loadedmetadata',function(){if(loaded)return;loaded=true;el.currentTime=p.position_seconds;});"
+        "});"
+        "var last=0;"
+        "el.addEventListener('timeupdate',function(){"
+        "  var t=el.currentTime;if(Math.abs(t-last)<5)return;last=t;"
+        "  fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},"
+        "    body:JSON.stringify({position_seconds:t,duration_seconds:el.duration||null})});"
+        "});})();</script>"
+    )
 
 
 def _login_form_html() -> str:
