@@ -104,6 +104,26 @@ def cmd_list_media(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_bootstrap_banner(host: str, port: int, username: str, password: str) -> None:
+    # Stylized so the operator can't miss it scrolling through uvicorn output.
+    bar = "=" * 70
+    display_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
+    url = f"http://{display_host}:{port}/login"
+    print(file=sys.stderr)
+    print(bar, file=sys.stderr)
+    print("  CUTTLEFISH FIRST-TIME SETUP", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("  An admin user has been created for you. Save this password —", file=sys.stderr)
+    print("  it will not be shown again. You can change it after logging", file=sys.stderr)
+    print("  in at /account.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"    URL:      {url}", file=sys.stderr)
+    print(f"    Username: {username}", file=sys.stderr)
+    print(f"    Password: {password}", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    print(file=sys.stderr)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import logging
     import threading
@@ -146,7 +166,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     # Always ensure the schema exists — makes a fresh install work end-to-end
     # without having to remember `init-db` first.
-    db.init_schema(db.connect(args.db))
+    from cuttlefish import auth as _auth
+    conn = db.connect(args.db)
+    db.init_schema(conn)
+    creds = _auth.bootstrap_admin_if_empty(conn)
+    if creds:
+        _print_bootstrap_banner(args.host, args.port, creds[0], creds[1])
 
     if args.with_worker:
         t = threading.Thread(

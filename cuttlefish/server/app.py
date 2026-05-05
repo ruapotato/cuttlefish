@@ -50,6 +50,11 @@ class UserPatchBody(BaseModel):
     password: Optional[str] = None
 
 
+class PasswordChangeBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
 # --- app factory ----------------------------------------------------------
 
 
@@ -297,6 +302,21 @@ def create_app(
     def api_me(request: Request):
         user = _require_user(request)
         return {"id": user["id"], "username": user["username"], "is_admin": bool(user["is_admin"])}
+
+    @app.put("/api/me/password")
+    def api_change_my_password(body: PasswordChangeBody, request: Request):
+        user = _require_user(request)
+        conn = _conn()
+        if auth.authenticate(conn, user["username"], body.current_password) != user["id"]:
+            raise HTTPException(401, "current password is incorrect")
+        if len(body.new_password) < 6:
+            raise HTTPException(400, "new password must be at least 6 characters")
+        with conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (auth.hash_password(body.new_password), user["id"]),
+            )
+        return {"ok": True}
 
     # --- Progress API ----------------------------------------------------
 
@@ -1313,12 +1333,23 @@ def create_app(
             "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
         ).fetchall()
         if not rows:
-            body = (
-                "<p class='empty'>No libraries yet. Add one with "
-                "<code>uv run cuttlefish add-library &lt;name&gt; &lt;path&gt; "
-                "--kind movies|tv|audiobooks</code> and then "
-                "<code>uv run cuttlefish scan</code>.</p>"
-            )
+            if user and user["is_admin"]:
+                body = (
+                    "<p class='empty'>No libraries yet. Open "
+                    "<a href='/admin/libraries'>Admin → Libraries</a>, add "
+                    "the path on disk where your media lives, then click "
+                    "<strong>Scan all libraries</strong>.</p>"
+                )
+            elif user:
+                body = (
+                    "<p class='empty'>No libraries yet. The admin needs "
+                    "to add one in /admin/libraries.</p>"
+                )
+            else:
+                body = (
+                    "<p class='empty'>No libraries yet. "
+                    "<a href='/login'>Log in</a> as admin to add one.</p>"
+                )
         else:
             items = "".join(
                 f"<li><a href='/library/{r['id']}'>{html.escape(r['name'])}</a> "
@@ -1584,12 +1615,22 @@ def create_app(
     def page_register(request: Request):
         user = _current_user(request)
         first_user = auth.user_count(_conn()) == 0
+        # First user: open form (covers DBs created without serve's bootstrap,
+        # e.g. existing installs upgrading or someone running serve once with
+        # output redirected and missing the banner).
         if not first_user and (not user or not user["is_admin"]):
-            raise HTTPException(403, "registration is admin-only after the first user")
+            body = (
+                "<h2>Register</h2>"
+                "<p>New accounts are created by an admin. Visit "
+                "<a href='/admin/users'>Admin → Users</a> if you have admin "
+                "access, or ask the server's admin to add you.</p>"
+                "<p><a href='/login'>&larr; Log in</a></p>"
+            )
+            return _page("Register", body, user=user)
         admin_note = (
             "<p class='hint'>You'll be the first user, so you'll be the admin.</p>"
             if first_user
-            else ""
+            else "<p class='hint'>You're an admin — adding a regular user.</p>"
         )
         body = f"""
         <form method='post' action='/register' class='auth'>
@@ -1763,6 +1804,62 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
 })();</script>
 """
         return _page("Cast", body, user=user)
+
+    @app.get("/account", response_class=HTMLResponse)
+    def page_account(request: Request, error: str = "", ok: str = ""):
+        user = _require_user(request)
+        notice = ""
+        if error:
+            notice = f"<p class='error'>{html.escape(error)}</p>"
+        elif ok:
+            notice = f"<p class='hint' style='color:#6c6'>{html.escape(ok)}</p>"
+        body = f"""
+<h2>Account</h2>
+<p>Signed in as <strong>{html.escape(user['username'])}</strong>"""
+        body += " (admin)" if user["is_admin"] else ""
+        body += f"""</p>
+{notice}
+<h3>Change password</h3>
+<form method='post' action='/account/password' class='auth'>
+  <label>Current password <input name='current_password' type='password' required></label>
+  <label>New password (>= 6 chars) <input name='new_password' type='password' minlength='6' required></label>
+  <label>Confirm new password <input name='confirm_password' type='password' minlength='6' required></label>
+  <button type='submit'>Change password</button>
+</form>
+<p><a href='/'>&larr; Home</a></p>
+"""
+        return _page("Account", body, user=user)
+
+    @app.post("/account/password")
+    def page_change_my_password(
+        request: Request,
+        current_password: str = Form(...),
+        new_password: str = Form(...),
+        confirm_password: str = Form(...),
+    ):
+        user = _require_user(request)
+        if new_password != confirm_password:
+            return RedirectResponse(
+                "/account?error=" + "New password and confirmation do not match.",
+                status_code=303,
+            )
+        if len(new_password) < 6:
+            return RedirectResponse(
+                "/account?error=" + "Password must be at least 6 characters.",
+                status_code=303,
+            )
+        conn = _conn()
+        if auth.authenticate(conn, user["username"], current_password) != user["id"]:
+            return RedirectResponse(
+                "/account?error=" + "Current password is incorrect.",
+                status_code=303,
+            )
+        with conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (auth.hash_password(new_password), user["id"]),
+            )
+        return RedirectResponse("/account?ok=Password+updated.", status_code=303)
 
     @app.post("/logout")
     def page_logout(request: Request):
@@ -2104,7 +2201,8 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
     if user:
         admin_link = " · <a href='/admin'>Admin</a>" if user['is_admin'] else ""
         userbar = (
-            f"<span class='userbar'>{html.escape(user['username'])}"
+            "<span class='userbar'>"
+            f"<a href='/account'>{html.escape(user['username'])}</a>"
             + (" (admin)" if user['is_admin'] else "")
             + admin_link
             + " · <form method='post' action='/logout'><button>Log out</button></form>"

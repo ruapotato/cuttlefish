@@ -64,28 +64,36 @@ installs every dependency. You don't need to activate anything.
 uv run cuttlefish serve --with-worker
 ```
 
-You'll see:
+The first time you run this, cuttlefish creates an admin account for you
+and prints the password right at the top of the output:
 
 ```
+======================================================================
+  CUTTLEFISH FIRST-TIME SETUP
+
+  An admin user has been created for you. Save this password —
+  it will not be shown again. You can change it after logging
+  in at /account.
+
+    URL:      http://localhost:8000/login
+    Username: admin
+    Password: oTcFmfx0W7fkhGxItPvFfw
+======================================================================
+
 started embedded encode worker (thread=encode-worker)
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-`--with-worker` runs the ffmpeg encode worker in a background thread inside
-the same process, so a single command is enough. Want it on your LAN? Add
+Copy that password somewhere safe — you'll change it in step 5. `--with-worker`
+runs the ffmpeg encode worker in a background thread inside the same
+process, so a single command is enough. Want it on your LAN? Add
 `--host 0.0.0.0`.
 
-### 4. Register the first user (in your browser)
+### 4. Log in and add a library
 
-Open http://localhost:8000/register
-
-Fill in a username and password (≥ 6 chars). The first user automatically
-becomes the **admin**. Future users are admin-only to create.
-
-### 5. Add a library
-
-Click **Admin → Libraries** in the header (or open
-http://localhost:8000/admin/libraries directly).
+Open the URL from the banner and log in with `admin` + the printed
+password. Once you're in, click **Admin → Libraries** in the header
+(or open `/admin/libraries`).
 
 Fill in the form:
 
@@ -98,37 +106,42 @@ Fill in the form:
 Click **Add**. Then click **Scan all libraries**. The page reloads and
 your library is populated.
 
+### 5. Change the auto-generated password
+
+Click your username in the top-right (or open `/account`). Set a
+password you can actually remember.
+
+While you're there: open **Admin → Users** to add accounts for family
+members. Each gets their own per-user resume positions and casting state.
+
 ### 6. Watch something
 
-Go to http://localhost:8000/ — you'll see your libraries. Click one →
-click any title → it plays in the browser. Captions appear automatically
-if a `.srt` lives next to the video. Posters show up automatically if a
-sibling `.jpg` (or `poster.jpg` in a folder) exists.
+Go to `/` — you'll see your libraries. Click one → click any title → it
+plays in the browser. Captions appear automatically if a `.srt` lives
+next to the video. Posters show up automatically if a sibling `.jpg`
+(or `poster.jpg` in a folder) exists.
 
-That's it. Everything else below is optional.
+That's it. **Everything else below is optional**, and everything from
+this point on is doable from the web UI — you don't need to drop back to
+the terminal again.
 
 ---
 
-## CLI alternative (if you prefer)
+## CLI shortcuts (for scripts and automation)
 
-Everything the web UI does is available from the command line. Same
-result, different ergonomics:
+The web UI does everything; you don't need any of these for normal use.
+They exist for backup scripts, cron jobs, declarative config, and
+"I want to write a one-liner" moments:
 
 ```bash
-# Same Python env, no activation needed:
-uv run cuttlefish init-db
+uv run cuttlefish list-libraries
+uv run cuttlefish list-media
+uv run cuttlefish scan                  # rescan all
+uv run cuttlefish scan Movies           # one library
 uv run cuttlefish add-library Movies /data/Movies --kind movies
-uv run cuttlefish add-library TV /data/TV-Shows --kind tv
-uv run cuttlefish add-library Audiobooks /data/Audiobooks --kind audiobooks
-
-uv run cuttlefish list-libraries        # what's registered
-uv run cuttlefish scan                  # all libraries
-uv run cuttlefish scan Movies           # one library by name
-uv run cuttlefish list-media            # everything found
-uv run cuttlefish list-media --library Movies
+uv run cuttlefish encode-now <id>       # synchronous encode of one item
+uv run cuttlefish encode-worker         # standalone worker (alt. to --with-worker)
 ```
-
-To run the server later: `uv run cuttlefish serve --with-worker`.
 
 ## Re-encoding (the headline feature)
 

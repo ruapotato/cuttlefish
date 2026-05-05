@@ -187,9 +187,13 @@ def test_register_page_first_user_offers_admin(client):
 
 def test_register_page_non_first_admin_only(client):
     client.post("/api/auth/register", data={"username": "alice", "password": "secret123"})
-    # Anonymous /register is now forbidden
+    client.post("/api/auth/logout")
+    # Anonymous /register now renders an admin-only message instead of a form
     r = client.get("/register")
-    assert r.status_code == 403
+    assert r.status_code == 200
+    # The form action POSTs to /register; if there's no form, the literal
+    # action attribute should not appear in the response.
+    assert "action='/register'" not in r.text
 
 
 def test_html_login_post_sets_cookie_and_redirects(client):

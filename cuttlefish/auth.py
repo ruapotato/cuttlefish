@@ -135,3 +135,19 @@ def authenticate(conn: sqlite3.Connection, username: str, password: str) -> Opti
     if verify_password(password, row["password_hash"]):
         return row["id"]
     return None
+
+
+def bootstrap_admin_if_empty(
+    conn: sqlite3.Connection, username: str = "admin"
+) -> Optional[tuple[str, str]]:
+    """If no users exist, create one admin with a random password.
+
+    Returns (username, password) on creation, None if there were already users.
+    The plaintext password is returned ONCE — caller is expected to display
+    it to the operator and then drop it.
+    """
+    if user_count(conn) > 0:
+        return None
+    password = secrets.token_urlsafe(16)
+    create_user(conn, username, password, is_admin=True)
+    return username, password
