@@ -698,12 +698,32 @@ def create_app(
     @app.post("/api/admin/asr/{media_id}")
     def api_admin_enqueue_asr(media_id: int, request: Request):
         _require_admin(request)
-        _encoded_or_404(media_id)
-        with _conn() as conn:
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM media WHERE id = ?", (media_id,)).fetchone() is None:
+            raise HTTPException(404, "media not found")
+        with conn:
             cur = conn.execute(
                 "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (media_id,)
             )
         return {"ok": True, "job_id": cur.lastrowid}
+
+    @app.post("/api/admin/asr/episode/{episode_id}")
+    def api_admin_enqueue_asr_episode(episode_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM tv_episodes WHERE id = ?", (episode_id,)).fetchone() is None:
+            raise HTTPException(404, "episode not found")
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO jobs (kind, episode_id) VALUES ('asr', ?)", (episode_id,)
+            )
+        return {"ok": True, "job_id": cur.lastrowid}
+
+    @app.get("/api/admin/asr-status")
+    def api_admin_asr_status(request: Request):
+        _require_admin(request)
+        from cuttlefish.workers import asr as _asr
+        return {"available": _asr.is_available()}
 
     @app.post("/api/admin/encode/episode/{episode_id}")
     def api_admin_enqueue_episode_encode(episode_id: int, request: Request):
@@ -1099,6 +1119,7 @@ library can contain all kinds of media, mixed.</p>
   <li><a href='/admin/encode'>Encode media</a> — {counts['media'] - counts['encoded']} not yet encoded</li>
   <li><a href='/admin/jobs'>Jobs</a> — {counts['queued']} queued, {counts['running']} running, {counts['failed']} failed</li>
   <li><a href='/admin/cleanup'>Cleanup originals</a> — manual delete after re-encode</li>
+  <li><a href='/admin/subtitles'>Subtitles</a> — generate via Parakeet ASR</li>
   <li><a href='/admin/cruft'>Cruft</a> — non-media files that may be safe to delete</li>
   <li><a href='/admin/libraries'>Libraries</a> — add, scan, delete library roots</li>
   <li><a href='/admin/users'>Users</a> — manage accounts and admin privileges</li>
@@ -1242,6 +1263,138 @@ library can contain all kinds of media, mixed.</p>
         if conn.execute("SELECT 1 FROM media WHERE id = ?", (media_id,)).fetchone() is None:
             raise HTTPException(404, "media not found")
         encoder.enqueue_encode(conn, media_id)
+        return RedirectResponse("/admin/jobs", status_code=303)
+
+    @app.get("/admin/subtitles", response_class=HTMLResponse)
+    def page_admin_subtitles(request: Request):
+        user = _require_admin(request)
+        from cuttlefish.workers import asr as _asr
+
+        conn = _conn()
+        # Movies + audiobooks: items currently lacking a discoverable subtitle
+        media_rows = conn.execute(
+            "SELECT m.id, m.kind, m.title_guess "
+            "FROM media m WHERE m.kind != 'tv_show' "
+            "ORDER BY m.kind, m.title_guess"
+        ).fetchall()
+        movie_items = []
+        for r in media_rows:
+            if r["kind"] != "movie":
+                continue
+            sub = subs_mod.subtitle_for_media(conn, r["id"])
+            movie_items.append({"id": r["id"], "title": r["title_guess"], "has_sub": sub is not None})
+
+        # TV episodes
+        ep_rows = conn.execute(
+            "SELECT e.id, e.season, e.episode, e.title_guess, "
+            "       m.id AS show_id, m.title_guess AS show_title "
+            "FROM tv_episodes e JOIN media m ON m.id = e.show_id "
+            "ORDER BY m.title_guess, e.season, e.episode"
+        ).fetchall()
+        ep_items = []
+        for r in ep_rows:
+            sub = subs_mod.subtitle_for_episode(conn, r["id"])
+            ep_items.append({
+                "id": r["id"],
+                "show_title": r["show_title"],
+                "label": f"S{r['season']:02d}E{r['episode']:02d}",
+                "title": r["title_guess"],
+                "has_sub": sub is not None,
+            })
+
+        asr_ok = _asr.is_available()
+        if asr_ok:
+            status_banner = (
+                "<p class='hint' style='color:#6c6'>"
+                "ASR worker dependencies are installed. Make sure you started "
+                "<code>serve --with-asr-worker</code> for queued jobs to actually run.</p>"
+            )
+        else:
+            status_banner = (
+                "<p class='error'>ASR dependencies are <strong>not installed</strong>. "
+                "Install them with <code>uv sync --extra asr</code> "
+                "(~2 GB of torch + nemo) and restart the server with "
+                "<code>serve --with-worker --with-asr-worker</code>. "
+                "You can still queue jobs from this page; they'll be "
+                "processed once a worker comes online.</p>"
+            )
+
+        def render_movie_row(it):
+            has = "✓" if it["has_sub"] else "—"
+            btn = (
+                f"<form method='post' action='/admin/asr/{it['id']}' style='display:inline'>"
+                f"<button type='submit'>Generate</button></form>"
+            )
+            return (
+                f"<tr><td>{html.escape(it['title'])}</td>"
+                f"<td>{has}</td><td>{btn}</td></tr>"
+            )
+
+        def render_ep_row(it):
+            has = "✓" if it["has_sub"] else "—"
+            btn = (
+                f"<form method='post' action='/admin/asr/episode/{it['id']}' style='display:inline'>"
+                f"<button type='submit'>Generate</button></form>"
+            )
+            return (
+                f"<tr><td>{html.escape(it['show_title'])} {it['label']} "
+                f"<span class='kind'>{html.escape(it['title'] or '')}</span></td>"
+                f"<td>{has}</td><td>{btn}</td></tr>"
+            )
+
+        sections = []
+        if movie_items:
+            sections.append(
+                "<h3>Movies</h3>"
+                "<table class='admin'><thead><tr>"
+                "<th>title</th><th>subtitle</th><th></th>"
+                "</tr></thead><tbody>"
+                + "".join(render_movie_row(it) for it in movie_items)
+                + "</tbody></table>"
+            )
+        if ep_items:
+            sections.append(
+                "<h3>TV episodes</h3>"
+                "<table class='admin'><thead><tr>"
+                "<th>episode</th><th>subtitle</th><th></th>"
+                "</tr></thead><tbody>"
+                + "".join(render_ep_row(it) for it in ep_items)
+                + "</tbody></table>"
+            )
+        if not sections:
+            sections.append("<p class='empty'>No movies or episodes scanned yet.</p>")
+
+        body = (
+            "<h2>Subtitles</h2>"
+            "<p class='hint'>Click <strong>Generate</strong> to enqueue a "
+            "Parakeet ASR job. The worker writes an SRT next to the source "
+            "file (or in the clean folder if the item has been encoded), and "
+            "the watch page picks it up automatically. ASR is slow on CPU — "
+            "GPU strongly recommended.</p>"
+            f"{status_banner}"
+            + "".join(sections)
+            + "<p><a href='/admin'>&larr; Admin</a></p>"
+        )
+        return _page("Subtitles", body, user=user)
+
+    @app.post("/admin/asr/{media_id}")
+    def page_admin_asr(media_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM media WHERE id = ?", (media_id,)).fetchone() is None:
+            raise HTTPException(404, "media not found")
+        with conn:
+            conn.execute("INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (media_id,))
+        return RedirectResponse("/admin/jobs", status_code=303)
+
+    @app.post("/admin/asr/episode/{episode_id}")
+    def page_admin_asr_episode(episode_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute("SELECT 1 FROM tv_episodes WHERE id = ?", (episode_id,)).fetchone() is None:
+            raise HTTPException(404, "episode not found")
+        with conn:
+            conn.execute("INSERT INTO jobs (kind, episode_id) VALUES ('asr', ?)", (episode_id,))
         return RedirectResponse("/admin/jobs", status_code=303)
 
     @app.get("/admin/cruft", response_class=HTMLResponse)
@@ -1472,12 +1625,24 @@ library can contain all kinds of media, mixed.</p>
         if row["kind"] == "audiobook":
             return RedirectResponse(f"/book/{media_id}", status_code=303)
         title = html.escape(row["title_guess"])
+        has_subtitle = subs_mod.subtitle_for_media(_conn(), media_id) is not None
         track_html = (
             f"<track kind='subtitles' label='Subtitles' srclang='en' "
             f"src='/subtitle/{media_id}' default>"
-            if subs_mod.subtitle_for_media(_conn(), media_id) is not None
+            if has_subtitle
             else ""
         )
+        admin_actions = ""
+        if user and user["is_admin"] and not has_subtitle:
+            admin_actions = (
+                "<div class='admin-actions'>"
+                f"<form method='post' action='/admin/asr/{media_id}'>"
+                "<button type='submit'>Generate subtitles via ASR</button>"
+                "</form>"
+                "<span class='hint'>Queues a Parakeet job. The worker writes "
+                "an SRT next to the source — refresh this page when it's done.</span>"
+                "</div>"
+            )
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1488,6 +1653,7 @@ library can contain all kinds of media, mixed.</p>
             f"<div class='theater-meta'>"
             f"<h2>{title}</h2>"
             "<p><a href='/'>&larr; Back to library</a></p>"
+            f"{admin_actions}"
             "</div>"
             + _player_progress_js(f"/api/progress/{media_id}")
         )
@@ -1546,12 +1712,24 @@ library can contain all kinds of media, mixed.</p>
             raise HTTPException(404, "episode not found")
         ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
         title = f"{row['show_title']} {ep_label}"
+        has_subtitle = subs_mod.subtitle_for_episode(_conn(), episode_id) is not None
         track_html = (
             f"<track kind='subtitles' label='Subtitles' srclang='en' "
             f"src='/subtitle/episode/{episode_id}' default>"
-            if subs_mod.subtitle_for_episode(_conn(), episode_id) is not None
+            if has_subtitle
             else ""
         )
+        admin_actions = ""
+        if user and user["is_admin"] and not has_subtitle:
+            admin_actions = (
+                "<div class='admin-actions'>"
+                f"<form method='post' action='/admin/asr/episode/{episode_id}'>"
+                "<button type='submit'>Generate subtitles via ASR</button>"
+                "</form>"
+                "<span class='hint'>Queues a Parakeet job. The worker writes "
+                "an SRT next to the source — refresh this page when it's done.</span>"
+                "</div>"
+            )
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1563,6 +1741,7 @@ library can contain all kinds of media, mixed.</p>
             f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
             f"<p>{html.escape(row['title_guess'] or '')}</p>"
             f"<p><a href='/show/{row['show_id']}'>&larr; All episodes</a></p>"
+            f"{admin_actions}"
             "</div>"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
         )
@@ -2168,6 +2347,13 @@ body.watch .theater video { width: 100%; height: auto; max-height: 90vh;
                              display: block; background: #000; }
 body.watch .theater-meta { max-width: 1400px; margin: 1rem auto; padding: 0 1rem; }
 body.watch .theater-meta h2 { margin-top: 0; }
+.admin-actions { background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
+                  padding: .75rem 1rem; margin-top: 1rem; display: flex;
+                  align-items: center; gap: 1rem; flex-wrap: wrap; }
+.admin-actions form { margin: 0; }
+.admin-actions button { padding: .4rem .8rem; background: #245; color: #eee;
+                         border: 1px solid #468; border-radius: 3px; cursor: pointer; font: inherit; }
+.admin-actions .hint { color: #888; font-size: .9em; }
 .empty, .hint { color: #888; }
 .error { color: #f66; }
 code { background: #222; padding: .15em .4em; border-radius: 3px; }

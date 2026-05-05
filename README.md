@@ -5,7 +5,7 @@ laptop, or your smart TV's built-in browser. Pre-encodes your library to a
 single compatible format instead of transcoding on the fly.
 
 > **Status: works end-to-end.** Scan, encode, watch with captions, resume,
-> cast between devices. 247 unit + integration tests run on every push,
+> cast between devices. 258 unit + integration tests run on every push,
 > including real ffmpeg encode/probe/thumbnail flows. See "What's not
 > implemented yet" at the bottom for the short list of gaps.
 
@@ -254,11 +254,22 @@ uv sync --extra asr                          # ~2 GB of torch + nemo
 uv run cuttlefish serve --with-worker --with-asr-worker
 ```
 
-In the admin, `POST /api/admin/asr/{media_id}` enqueues an ASR job. The
-worker writes the resulting SRT into the clean folder so the watch page
-picks it up automatically.
+Once the server is running, **two web flows** kick off ASR jobs:
 
-GPU strongly recommended.
+- **Per-item from the watch page**: open any movie or TV episode that
+  doesn't already have subtitles. Below the player, admins see a
+  **Generate subtitles via ASR** button. One click queues the job.
+- **Bulk from `/admin/subtitles`**: a table of every movie + episode
+  with a "subtitle present?" column and a Generate button on each row.
+  The page also shows whether the ASR worker dependencies are
+  installed; if not, you can still queue jobs and they'll run when a
+  worker comes online.
+
+The worker writes the resulting SRT next to the source file (or in the
+clean folder if the item has been encoded). Refresh the watch page when
+the job finishes — captions appear automatically.
+
+GPU strongly recommended; on CPU one short film can take several minutes.
 
 ## Optional: TLS via Let's Encrypt
 
@@ -323,7 +334,7 @@ See [docs/casting.md](docs/casting.md) for design notes.
 | `/continue-watching` | What you've started, with mark-watched + reset |
 | `/cast` | Multi-device controller |
 | `/login`, `/register` | Auth |
-| `/admin`, `/admin/{libraries,users,encode,jobs,cleanup,cruft}` | Admin |
+| `/admin`, `/admin/{libraries,users,encode,jobs,cleanup,cruft,subtitles}` | Admin |
 
 ### JSON API (a selection — full list at `/api/docs`)
 
@@ -365,7 +376,7 @@ GET    /health
 
 ```bash
 uv sync --extra dev          # adds pytest + ruff
-uv run pytest -q             # 247 tests, ~60 seconds (most of it real ffmpeg)
+uv run pytest -q             # 258 tests, ~75 seconds (most of it real ffmpeg)
 uv run ruff check .
 ```
 

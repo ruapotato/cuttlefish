@@ -195,6 +195,63 @@ def _extract_words_from_nemo_result(results) -> list[dict]:
     return words
 
 
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".wmv"}
+
+
+def _resolve_asr_target(conn, job) -> tuple[Path, Path, str]:
+    """Pick the video to transcribe and where to write the SRT for a job.
+
+    Prefers the encoded version when available (writes SRT alongside it in
+    the clean folder). Otherwise transcribes the source and drops the SRT
+    next to it as a sidecar — which the scanner / subtitle resolver picks
+    up automatically.
+
+    Returns (video_path, srt_output_path, kind) where kind is 'media' or
+    'episode'. Raises RuntimeError on unresolvable jobs.
+    """
+    if job["episode_id"]:
+        row = conn.execute(
+            "SELECT e.source_path, ee.video_path AS encoded_video, "
+            "       ee.clean_dir AS encoded_dir "
+            "FROM tv_episodes e LEFT JOIN encoded_episodes ee "
+            "ON ee.episode_id = e.id WHERE e.id = ?",
+            (job["episode_id"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"episode {job['episode_id']} not found")
+        if row["encoded_video"] and Path(row["encoded_video"]).is_file():
+            video = Path(row["encoded_video"])
+            srt = Path(row["encoded_dir"]) / (video.stem + ".srt")
+        else:
+            video = Path(row["source_path"])
+            srt = video.with_suffix(".srt")
+        return video, srt, "episode"
+    if job["media_id"]:
+        row = conn.execute(
+            "SELECT m.source_path, e.video_path AS encoded_video, "
+            "       e.clean_dir AS encoded_dir "
+            "FROM media m LEFT JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE m.id = ?",
+            (job["media_id"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"media {job['media_id']} not found")
+        if row["encoded_video"] and Path(row["encoded_video"]).is_file():
+            video = Path(row["encoded_video"])
+            srt = Path(row["encoded_dir"]) / (video.stem + ".srt")
+            return video, srt, "media"
+        src = Path(row["source_path"])
+        if src.is_file():
+            return src, src.with_suffix(".srt"), "media"
+        if src.is_dir():
+            for child in sorted(src.iterdir()):
+                if child.is_file() and child.suffix.lower() in VIDEO_EXTS:
+                    return child, child.with_suffix(".srt"), "media"
+            raise RuntimeError(f"no video file inside {src}")
+        raise RuntimeError(f"source {src} is neither file nor dir")
+    raise RuntimeError("ASR job has neither media_id nor episode_id")
+
+
 def run_worker(
     db_path=None,
     once: bool = False,
@@ -214,22 +271,29 @@ def run_worker(
                 return processed
             time.sleep(poll_interval)
             continue
-        log.info("ASR job %s for media %s", job["id"], job["media_id"])
+        log.info(
+            "ASR job %s (media=%s episode=%s)",
+            job["id"], job["media_id"], job["episode_id"],
+        )
         try:
-            row = conn.execute(
-                "SELECT e.video_path, e.clean_dir FROM encoded_files e WHERE e.media_id = ?",
-                (job["media_id"],),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("media has no encoded version; ASR requires the encoded video first")
-            video = Path(row["video_path"])
-            srt = Path(row["clean_dir"]) / (video.stem + ".srt")
+            video, srt, kind = _resolve_asr_target(conn, job)
             transcribe_to_srt(video, srt, ffmpeg=ffmpeg)
+            # Reflect the new sidecar in the encoded_* tables when present
+            # so subtitle_for_media() / subtitle_for_episode() find it via
+            # the column lookup as well as the disk fallback.
             with conn:
-                conn.execute(
-                    "UPDATE encoded_files SET subtitle_path = ? WHERE media_id = ?",
-                    (str(srt), job["media_id"]),
-                )
+                if kind == "episode":
+                    conn.execute(
+                        "UPDATE encoded_episodes SET subtitle_path = ? "
+                        "WHERE episode_id = ?",
+                        (str(srt), job["episode_id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE encoded_files SET subtitle_path = ? "
+                        "WHERE media_id = ?",
+                        (str(srt), job["media_id"]),
+                    )
             encoder.mark_done(conn, job["id"], {"srt": str(srt)})
             processed += 1
         except Exception as e:
