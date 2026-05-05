@@ -1479,14 +1479,19 @@ library can contain all kinds of media, mixed.</p>
             else ""
         )
         body = (
-            f"<h2>{title}</h2>"
-            f"<video id='player' controls preload='metadata' src='/stream/{media_id}'>"
+            f"<div class='theater'>"
+            f"<video id='player' controls autoplay playsinline preload='auto' "
+            f"src='/stream/{media_id}'>"
             f"{track_html}"
             "Your browser does not support the video element.</video>"
-            "<p><a href='/'>&larr; Libraries</a></p>"
+            f"</div>"
+            f"<div class='theater-meta'>"
+            f"<h2>{title}</h2>"
+            "<p><a href='/'>&larr; Back to library</a></p>"
+            "</div>"
             + _player_progress_js(f"/api/progress/{media_id}")
         )
-        return _page(title, body, user=user)
+        return _page(title, body, user=user, body_class="watch")
 
     @app.get("/show/{show_id}", response_class=HTMLResponse)
     def page_show(show_id: int, request: Request):
@@ -1548,15 +1553,20 @@ library can contain all kinds of media, mixed.</p>
             else ""
         )
         body = (
-            f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
-            f"<p>{html.escape(row['title_guess'] or '')}</p>"
-            f"<video id='player' controls preload='metadata' src='/stream/episode/{episode_id}'>"
+            f"<div class='theater'>"
+            f"<video id='player' controls autoplay playsinline preload='auto' "
+            f"src='/stream/episode/{episode_id}'>"
             f"{track_html}"
             "Your browser does not support the video element.</video>"
+            f"</div>"
+            f"<div class='theater-meta'>"
+            f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
+            f"<p>{html.escape(row['title_guess'] or '')}</p>"
             f"<p><a href='/show/{row['show_id']}'>&larr; All episodes</a></p>"
+            "</div>"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
         )
-        return _page(title, body, user=user)
+        return _page(title, body, user=user, body_class="watch")
 
     @app.get("/book/{book_id}", response_class=HTMLResponse)
     def page_book(book_id: int, request: Request):
@@ -1619,15 +1629,21 @@ library can contain all kinds of media, mixed.</p>
   el.addEventListener('ended', function(){{
     if(idx<playlist.length-1) play(idx+1);
   }});
-  // Resume + save progress
+  // Resume + save progress + autoplay (with muted fallback)
   fetch('/api/progress/book/' + book_id).then(function(r){{return r.ok?r.json():null;}}).then(function(p){{
-    if(!p||!p.current_track_id){{ load(0); return; }}
-    var i = playlist.findIndex(function(t){{return t.id===p.current_track_id;}});
-    if(i<0) i = 0;
-    load(i);
-    el.addEventListener('loadedmetadata', function once(){{
-      el.removeEventListener('loadedmetadata', once);
-      el.currentTime = p.position_seconds || 0;
+    if(!p||!p.current_track_id){{ load(0); }}
+    else {{
+      var i = playlist.findIndex(function(t){{return t.id===p.current_track_id;}});
+      if(i<0) i = 0;
+      load(i);
+      el.addEventListener('loadedmetadata', function once(){{
+        el.removeEventListener('loadedmetadata', once);
+        el.currentTime = p.position_seconds || 0;
+      }});
+    }}
+    el.addEventListener('canplay', function once(){{
+      el.removeEventListener('canplay', once);
+      el.play().catch(function(){{el.muted=true;el.play().catch(function(){{}});}});
     }});
   }});
   var last = 0;
@@ -2142,6 +2158,16 @@ ol.chapters button:hover { text-decoration: underline; }
 .kind { color: #888; font-size: .8em; margin-left: .5rem; }
 video, audio { width: 100%; max-height: 70vh; background: #000; }
 audio { max-height: 50px; }
+/* Theater mode for the watch page: video stretches to the viewport. */
+body.watch { max-width: none; margin: 0; padding: 0; background: #000; }
+body.watch header { max-width: 1400px; margin: 0 auto; padding: .4rem 1rem; }
+body.watch nav.top { max-width: 1400px; margin: 0 auto; padding: 0 1rem; }
+body.watch .theater { width: 100%; background: #000; display: flex;
+                       justify-content: center; align-items: center; }
+body.watch .theater video { width: 100%; height: auto; max-height: 90vh;
+                             display: block; background: #000; }
+body.watch .theater-meta { max-width: 1400px; margin: 1rem auto; padding: 0 1rem; }
+body.watch .theater-meta h2 { margin-top: 0; }
 .empty, .hint { color: #888; }
 .error { color: #f66; }
 code { background: #222; padding: .15em .4em; border-radius: 3px; }
@@ -2279,7 +2305,12 @@ def _watch_url(kind: str, media_id: int) -> str:
 
 
 def _player_progress_js(progress_url: str) -> str:
-    """JS that resumes + saves position via the given progress endpoint."""
+    """JS that resumes, saves position, and starts playback automatically.
+
+    Tries to play with sound; on failure (browsers block autoplay-with-sound
+    until they trust the site) falls back to muted autoplay so you at least
+    see the picture moving — user clicks the unmute button on the controls.
+    """
     return (
         "<script>(function(){"
         "var el=document.getElementById('player');"
@@ -2288,6 +2319,10 @@ def _player_progress_js(progress_url: str) -> str:
         "fetch(url).then(function(r){return r.ok?r.json():null;}).then(function(p){"
         "  if(!p||!p.position_seconds)return;"
         "  el.addEventListener('loadedmetadata',function(){if(loaded)return;loaded=true;el.currentTime=p.position_seconds;});"
+        "});"
+        "el.addEventListener('canplay',function once(){"
+        "  el.removeEventListener('canplay',once);"
+        "  el.play().catch(function(){el.muted=true;el.play().catch(function(){});});"
         "});"
         "var last=0;"
         "el.addEventListener('timeupdate',function(){"
@@ -2307,7 +2342,9 @@ def _login_form_html() -> str:
     </form>"""
 
 
-def _page(title: str, body_html: str, user: Optional[dict]) -> str:
+def _page(
+    title: str, body_html: str, user: Optional[dict], body_class: str = ""
+) -> str:
     if user:
         admin_link = " · <a href='/admin'>Admin</a>" if user['is_admin'] else ""
         userbar = (
@@ -2329,6 +2366,7 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
     else:
         userbar = "<span class='userbar'><a href='/login'>Log in</a> · <a href='/register'>Register</a></span>"
         nav = "<nav class='top'><a href='/'>Libraries</a><a href='/search'>Search</a></nav>"
+    body_attr = f' class="{body_class}"' if body_class else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2337,7 +2375,7 @@ def _page(title: str, body_html: str, user: Optional[dict]) -> str:
 <title>{html.escape(title)} — Cuttlefish</title>
 <style>{_STYLE}</style>
 </head>
-<body>
+<body{body_attr}>
 <header>
   <h1><a href="/">Cuttlefish</a></h1>
   {userbar}
