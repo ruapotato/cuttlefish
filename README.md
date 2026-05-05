@@ -287,30 +287,45 @@ The worker writes the resulting SRT next to the source file (or in the
 clean folder if the item has been encoded). Refresh the watch page when
 the job finishes — captions appear automatically.
 
-GPU strongly recommended; on CPU one short film can take several minutes.
-The first run also downloads the Parakeet model (~1 GB).
+GPU strongly recommended (CPU is unworkably slow for Parakeet — minutes
+per minute of audio). The first run also downloads the Parakeet model
+(~1 GB) and caches it under `~/.cache/huggingface/`.
 
-#### CUDA driver too old?
+#### How GPU detection works
 
-If you see an error like `The NVIDIA driver on your system is too old`
-in `/admin/jobs`, the PyTorch shipped with `[asr]` was built for a newer
-CUDA than your driver supports. You have two options:
+`./start.sh --asr` does this for you automatically:
 
-1. **Run ASR on CPU** (easiest, just slower):
+1. Runs `uv sync --extra asr` — installs the default torch wheel.
+2. Runs `nvidia-smi` to detect your CUDA driver version.
+3. If the default wheel won't work for your driver (e.g. driver speaks
+   CUDA 12.4 but the default wheel wants 12.6+), reinstalls torch from
+   the matching wheel index:
 
-   ```bash
-   ./start.sh --asr-cpu          # equivalent to: CUTTLEFISH_ASR_CPU=1 ./start.sh
-   ```
+   | Your CUDA | Wheel installed |
+   |---|---|
+   | 11.x | `cu118` |
+   | 12.0 – 12.3 | `cu121` |
+   | 12.4 – 12.5 | `cu124` |
+   | 12.6+ | default (no swap) |
 
-   The `CUTTLEFISH_ASR_CPU=1` env var hides GPUs from torch before any
-   import, so NeMo loads cleanly on CPU. Cuttlefish also probes CUDA at
-   model-load time and falls back automatically when it detects this
-   exact failure mode, but the env var makes it explicit and skips the
-   probe.
+   This is what fixes the
+   "`The NVIDIA driver on your system is too old`" error you'll see if
+   the wrong wheel is installed.
 
-2. **Install a PyTorch matching your driver.** See
-   <https://pytorch.org/get-started/locally/> for the right `--index-url`
-   for your CUDA version, then `uv pip install` it inside `.venv/`.
+If you want to force a specific CUDA version (e.g. when `nvidia-smi`
+isn't available, or you want to use a different wheel):
+
+```bash
+./start.sh --asr --asr-cuda 12.4
+```
+
+If the swap fails (network issue, etc.) cuttlefish has runtime fallbacks:
+the worker probes CUDA at model-load time and switches to CPU
+automatically. You can also force CPU explicitly:
+
+```bash
+./start.sh --asr-cpu          # equivalent to: CUTTLEFISH_ASR_CPU=1 ./start.sh
+```
 
 ## Optional: TLS via Let's Encrypt
 

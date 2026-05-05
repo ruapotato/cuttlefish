@@ -2,10 +2,14 @@
 # Starts cuttlefish with every worker that this machine can run.
 #
 # Usage:
-#   ./start.sh                  # base install, ASR worker on if [asr] is installed
-#   ./start.sh --asr            # also install [asr] (~2 GB) before starting
-#   ./start.sh --no-asr-worker  # skip the ASR worker even if available
-#   ./start.sh --asr-cpu        # run ASR on CPU only (use when CUDA driver mismatches)
+#   ./start.sh                       # base install, ASR worker on if [asr] is installed
+#   ./start.sh --asr                 # also install [asr] (~2 GB), then auto-detect
+#                                    # your CUDA version and install the matching torch
+#                                    # wheel so ASR runs on GPU
+#   ./start.sh --asr --asr-cuda 12.4 # force a specific CUDA version for the torch
+#                                    # wheel (e.g. when nvidia-smi isn't available)
+#   ./start.sh --no-asr-worker       # skip the ASR worker even if available
+#   ./start.sh --asr-cpu             # run ASR on CPU only (slow — for testing)
 #   ./start.sh --host 0.0.0.0 --port 9000   # forward flags to cuttlefish serve
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,8 +32,12 @@ fi
 
 INSTALL_ASR=false
 SKIP_ASR_WORKER=false
+ASR_CUDA_OVERRIDE=""
 PASSTHROUGH=()
-for arg in "$@"; do
+i=0
+args=("$@")
+while [[ $i -lt ${#args[@]} ]]; do
+    arg=${args[$i]}
     case "$arg" in
         --asr)
             INSTALL_ASR=true
@@ -40,10 +48,18 @@ for arg in "$@"; do
         --asr-cpu)
             export CUTTLEFISH_ASR_CPU=1
             ;;
+        --asr-cuda)
+            i=$((i + 1))
+            ASR_CUDA_OVERRIDE="${args[$i]:-}"
+            ;;
+        --asr-cuda=*)
+            ASR_CUDA_OVERRIDE="${arg#--asr-cuda=}"
+            ;;
         *)
             PASSTHROUGH+=("$arg")
             ;;
     esac
+    i=$((i + 1))
 done
 
 # --- Sync deps ----------------------------------------------------------
@@ -54,6 +70,49 @@ if $INSTALL_ASR; then
 else
     echo ">>> Syncing dependencies..."
     uv sync
+fi
+
+# --- Match torch to the local CUDA driver if one is present -------------
+# Parakeet on CPU is slow enough to be unusable, so we go to real lengths
+# to ensure the GPU path works. The default 'torch' wheel from PyPI is
+# compiled for whichever CUDA version PyTorch ships by default (12.6+
+# at time of writing). If your driver is older you'll get a
+# 'NVIDIA driver too old' error at model load. Fix: install a torch
+# wheel built for your driver's CUDA.
+swap_torch_for_cuda() {
+    local cuda_ver tag
+    if [[ -n "$ASR_CUDA_OVERRIDE" ]]; then
+        cuda_ver="$ASR_CUDA_OVERRIDE"
+        echo ">>> Using --asr-cuda override: $cuda_ver"
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        cuda_ver=$(nvidia-smi 2>/dev/null \
+            | grep -m1 -oE 'CUDA Version:\s*[0-9]+\.[0-9]+' \
+            | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    fi
+    if [[ -z "${cuda_ver:-}" ]]; then
+        return
+    fi
+    case "$cuda_ver" in
+        11.[0-8])     tag="cu118" ;;
+        12.[0-3])     tag="cu121" ;;
+        12.[4-5])     tag="cu124" ;;
+        *)
+            echo ">>> CUDA $cuda_ver: default torch wheel works; no swap needed."
+            return
+            ;;
+    esac
+    echo ">>> Detected CUDA $cuda_ver — installing torch wheel for $tag..."
+    if uv pip install --reinstall-package torch torch \
+            --index-url "https://download.pytorch.org/whl/$tag" \
+            --extra-index-url "https://pypi.org/simple"; then
+        echo ">>> torch installed for $tag — ASR should run on GPU."
+    else
+        echo ">>> WARNING: couldn't swap torch wheel; ASR will fall back to CPU." >&2
+    fi
+}
+
+if $INSTALL_ASR; then
+    swap_torch_for_cuda
 fi
 
 # --- Decide which worker flags to pass ---------------------------------
