@@ -80,28 +80,39 @@ fi
 # 'NVIDIA driver too old' error at model load. Fix: install a torch
 # wheel built for your driver's CUDA.
 swap_torch_for_cuda() {
-    local cuda_ver tag
+    local cuda_ver="" tag="" nvsmi_out=""
+    echo ">>> Probing for a usable CUDA driver..."
     if [[ -n "$ASR_CUDA_OVERRIDE" ]]; then
         cuda_ver="$ASR_CUDA_OVERRIDE"
         echo ">>> Using --asr-cuda override: $cuda_ver"
     elif command -v nvidia-smi >/dev/null 2>&1; then
-        cuda_ver=$(nvidia-smi 2>/dev/null \
-            | grep -m1 -oE 'CUDA Version:\s*[0-9]+\.[0-9]+' \
-            | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        # Pipefail + set -e make piped grep brittle when a line doesn't match.
+        # Capture the full output once and use bash regex against the string.
+        nvsmi_out=$(nvidia-smi 2>/dev/null || true)
+        if [[ "$nvsmi_out" =~ CUDA\ Version:[[:space:]]+([0-9]+\.[0-9]+) ]]; then
+            cuda_ver="${BASH_REMATCH[1]}"
+            echo ">>> nvidia-smi reports CUDA $cuda_ver"
+        else
+            echo ">>> nvidia-smi found but no 'CUDA Version: X.Y' line in its output"
+            echo "    (pass --asr-cuda 12.4 or similar to skip detection)"
+        fi
+    else
+        echo ">>> nvidia-smi not on PATH — assuming no GPU; ASR will use CPU."
     fi
-    if [[ -z "${cuda_ver:-}" ]]; then
-        return
+    if [[ -z "$cuda_ver" ]]; then
+        return 0
     fi
     case "$cuda_ver" in
         11.[0-8])     tag="cu118" ;;
         12.[0-3])     tag="cu121" ;;
         12.[4-5])     tag="cu124" ;;
         *)
-            echo ">>> CUDA $cuda_ver: default torch wheel works; no swap needed."
-            return
+            echo ">>> CUDA $cuda_ver: default torch wheel should work; no swap needed."
+            return 0
             ;;
     esac
-    echo ">>> Detected CUDA $cuda_ver — installing torch wheel for $tag..."
+    echo ">>> Installing torch wheel for CUDA $cuda_ver ($tag) — this swaps the"
+    echo "    torch installed by 'uv sync' for one matching your driver."
     if uv pip install --reinstall-package torch torch \
             --index-url "https://download.pytorch.org/whl/$tag" \
             --extra-index-url "https://pypi.org/simple"; then
@@ -109,6 +120,7 @@ swap_torch_for_cuda() {
     else
         echo ">>> WARNING: couldn't swap torch wheel; ASR will fall back to CPU." >&2
     fi
+    return 0
 }
 
 if $INSTALL_ASR; then
