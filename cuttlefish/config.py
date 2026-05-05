@@ -29,13 +29,9 @@ from pathlib import Path
 from typing import Optional
 
 
-VALID_KINDS = ("movies", "tv", "audiobooks")
-
-
 @dataclass
 class LibraryEntry:
     name: str
-    kind: str
     root: Path
 
 
@@ -97,18 +93,13 @@ class Config:
             cfg.tls.renewal_window_days = int(tls.get("renewal_window_days", 30))
         for entry in data.get("library", []) or []:
             name = entry.get("name")
-            kind = entry.get("kind")
             root = entry.get("root")
-            if not (name and kind and root):
+            if not (name and root):
                 raise ValueError(
-                    f"[[library]] entry missing name/kind/root: {entry!r}"
-                )
-            if kind not in VALID_KINDS:
-                raise ValueError(
-                    f"invalid library kind {kind!r} (expected one of {VALID_KINDS})"
+                    f"[[library]] entry missing name or root: {entry!r}"
                 )
             cfg.libraries.append(
-                LibraryEntry(name=name, kind=kind, root=Path(root).expanduser())
+                LibraryEntry(name=name, root=Path(root).expanduser())
             )
         return cfg
 
@@ -122,15 +113,15 @@ class Config:
             if row is None:
                 with conn:
                     conn.execute(
-                        "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-                        (lib.name, lib.kind, str(lib.root.resolve())),
+                        "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+                        (lib.name, str(lib.root.resolve())),
                     )
                 added += 1
             else:
                 with conn:
                     conn.execute(
-                        "UPDATE libraries SET kind = ?, root_path = ? WHERE id = ?",
-                        (lib.kind, str(lib.root.resolve()), row["id"]),
+                        "UPDATE libraries SET root_path = ? WHERE id = ?",
+                        (str(lib.root.resolve()), row["id"]),
                     )
                 updated += 1
         return added, updated

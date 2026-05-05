@@ -32,7 +32,7 @@ def test_list_cruft_finds_non_media_files(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
@@ -53,7 +53,7 @@ def test_list_cruft_keeps_paired_sidecars(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
@@ -74,7 +74,7 @@ def test_list_cruft_skips_hidden_paths(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
@@ -94,7 +94,7 @@ def test_list_cruft_audiobook_kind_audio_extensions(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('b','audiobooks',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('b', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
@@ -111,7 +111,7 @@ def test_is_path_inside_a_library(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
     assert cruft.is_path_inside_a_library(conn, root / "x.txt") is True
@@ -130,10 +130,10 @@ def _admin_client(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-        scanner.scan_library(conn, cur.lastrowid, root, "movies")
+        scanner.scan_library(conn, cur.lastrowid, root)
     client = TestClient(create_app(db_path=db_path))
     client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
     client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
@@ -214,11 +214,11 @@ def test_encode_episode_creates_season_layout(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "tv")
+    scanner.scan_library(conn, lib_id, root)
     ep_id = conn.execute("SELECT id FROM tv_episodes").fetchone()["id"]
 
     result = encoder.encode_episode(conn, ep_id, ffmpeg=FFMPEG)
@@ -240,10 +240,10 @@ def test_run_worker_handles_episode_jobs(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     ep_id = conn.execute("SELECT id FROM tv_episodes").fetchone()["id"]
     encoder.enqueue_episode_encode(conn, ep_id)
     n = encoder.run_worker(db_path=db_path, once=True, ffmpeg=FFMPEG)
@@ -263,10 +263,10 @@ def test_admin_episode_encode_endpoint(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     ep_id = conn.execute("SELECT id FROM tv_episodes").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
@@ -293,11 +293,11 @@ def test_run_worker_in_thread_processes_a_job(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "movies")
+    scanner.scan_library(conn, lib_id, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
 
     encoder.enqueue_encode(conn, media_id)

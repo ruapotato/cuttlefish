@@ -99,12 +99,26 @@ Fill in the form:
 
 | field | example |
 |---|---|
-| Name | `Movies` |
-| Kind | `Movies` |
-| Root path | `/data/Movies` (or wherever your files actually live) |
+| Name | `Media` |
+| Root path | `/data/Media` (or wherever your files actually live) |
 
 Click **Add**. Then click **Scan all libraries**. The page reloads and
 your library is populated.
+
+**A library is just a folder.** Cuttlefish figures out what each subfolder
+contains by looking at it:
+
+| You give it… | It treats it as… |
+|---|---|
+| A loose `Movie.mp4` at the library root | a movie |
+| A folder containing one or more video files (e.g. `Movie/Movie.mp4`) | a movie |
+| A folder containing audio files (e.g. `Book/01.mp3`) | an audiobook |
+| A folder containing other folders (e.g. `Show/Season 01/...`) | a TV show — subfolders are seasons |
+| A folder of folders that contain audio | an audiobook series — recurses |
+
+So one library can hold movies and TV shows and audiobooks side by side.
+You don't have to organize them into separate top-level folders unless
+you want to.
 
 ### 5. Change the auto-generated password
 
@@ -137,8 +151,8 @@ They exist for backup scripts, cron jobs, declarative config, and
 uv run cuttlefish list-libraries
 uv run cuttlefish list-media
 uv run cuttlefish scan                  # rescan all
-uv run cuttlefish scan Movies           # one library
-uv run cuttlefish add-library Movies /data/Movies --kind movies
+uv run cuttlefish scan Media            # one library by name
+uv run cuttlefish add-library Media /data/Media
 uv run cuttlefish encode-now <id>       # synchronous encode of one item
 uv run cuttlefish encode-worker         # standalone worker (alt. to --with-worker)
 ```
@@ -248,14 +262,8 @@ dns_credentials_file = "/etc/cuttlefish/cloudflare.ini"
 cert_dir = "/etc/letsencrypt/live/media.example.com"
 
 [[library]]
-name = "Movies"
-kind = "movies"
-root = "/data/Movies"
-
-[[library]]
-name = "TV"
-kind = "tv"
-root = "/data/TV-Shows"
+name = "Media"
+root = "/data/Media"
 ```
 
 Run with:

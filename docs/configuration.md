@@ -19,20 +19,13 @@ with_asr_worker = false     # run the Parakeet ASR worker (needs [asr] extra)
 ffmpeg = "ffmpeg"           # path to ffmpeg
 
 [[library]]
-name = "Movies"
-kind = "movies"             # movies | tv | audiobooks
-root = "/data/Movies"
-
-[[library]]
-name = "TV"
-kind = "tv"
-root = "/data/TV-Shows"
-
-[[library]]
-name = "Audiobooks"
-kind = "audiobooks"
-root = "/data/Audiobooks"
+name = "Media"
+root = "/data/Media"
 ```
+
+A library is just a folder. Cuttlefish auto-detects what each subfolder
+contains — you can have movies, TV shows, and audiobooks all in the same
+library, in whatever organization you already use.
 
 Run with:
 
@@ -42,8 +35,7 @@ uv run cuttlefish serve --config /etc/cuttlefish/cuttlefish.toml
 
 `serve --config` does the following before starting uvicorn:
 
-1. Reads the file, validates it (kind must be `movies` | `tv` | `audiobooks`,
-   each library entry must have name + kind + root).
+1. Reads the file, validates it (each library entry must have name + root).
 2. Initializes the schema if the DB is fresh.
 3. Upserts each `[[library]]` entry into the `libraries` table — adds new
    ones, updates existing entries (matched by `name`).

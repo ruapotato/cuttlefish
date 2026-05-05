@@ -177,11 +177,11 @@ def encoded_db_with_admin(tmp_path: Path):
     db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-            ("movies", "movies", str(root)),
+            "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+            ("movies", str(root)),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "movies")
+    scanner.scan_library(conn, lib_id, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     encoder.encode_media(conn, media_id, ffmpeg=ffmpeg)
     return db_path, media_id
@@ -292,11 +292,11 @@ def test_admin_metadata_409_without_encoded(tmp_path: Path):
     db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-            ("m", "movies", str(root)),
+            "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+            ("m", str(root)),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "movies")
+    scanner.scan_library(conn, lib_id, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
 
     def handler(req):

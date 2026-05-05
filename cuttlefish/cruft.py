@@ -27,16 +27,16 @@ class CruftEntry:
 
 def list_cruft(conn: sqlite3.Connection, library_id: int) -> list[CruftEntry]:
     lib = conn.execute(
-        "SELECT root_path, kind FROM libraries WHERE id = ?", (library_id,)
+        "SELECT root_path FROM libraries WHERE id = ?", (library_id,)
     ).fetchone()
     if lib is None:
         return []
     root = Path(lib["root_path"])
     if not root.is_dir():
         return []
-    media_exts: frozenset[str] = (
-        VIDEO_EXTS if lib["kind"] != "audiobooks" else AUDIO_EXTS
-    )
+    # A library can mix all kinds of media. Both audio and video count as
+    # "media" — anything outside that and the sidecar set is cruft.
+    media_exts: frozenset[str] = VIDEO_EXTS | AUDIO_EXTS
 
     out: list[CruftEntry] = []
     for path in root.rglob("*"):

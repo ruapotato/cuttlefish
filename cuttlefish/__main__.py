@@ -22,13 +22,13 @@ def cmd_add_library(args: argparse.Namespace) -> int:
     try:
         with conn:
             conn.execute(
-                "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-                (args.name, args.kind, str(root)),
+                "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+                (args.name, str(root)),
             )
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print(f"Added library {args.name!r} ({args.kind}) at {root}")
+    print(f"Added library {args.name!r} at {root}")
     return 0
 
 
@@ -36,13 +36,13 @@ def cmd_list_libraries(args: argparse.Namespace) -> int:
     conn = db.connect(args.db)
     db.init_schema(conn)
     rows = conn.execute(
-        "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
+        "SELECT id, name, root_path FROM libraries ORDER BY id"
     ).fetchall()
     if not rows:
         print("No libraries.")
         return 0
     for r in rows:
-        print(f"{r['id']:>3}  {r['kind']:<10}  {r['name']:<20}  {r['root_path']}")
+        print(f"{r['id']:>3}  {r['name']:<20}  {r['root_path']}")
     return 0
 
 
@@ -51,7 +51,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     db.init_schema(conn)
     if args.name:
         rows = conn.execute(
-            "SELECT id, name, kind, root_path FROM libraries WHERE name = ?",
+            "SELECT id, name, root_path FROM libraries WHERE name = ?",
             (args.name,),
         ).fetchall()
         if not rows:
@@ -59,15 +59,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
             return 1
     else:
         rows = conn.execute(
-            "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
+            "SELECT id, name, root_path FROM libraries ORDER BY id"
         ).fetchall()
         if not rows:
             print("No libraries to scan. Use `add-library` first.", file=sys.stderr)
             return 1
     total = scanner.ScanResult()
     for r in rows:
-        print(f"Scanning {r['name']} ({r['kind']}) at {r['root_path']} ...")
-        result = scanner.scan_library(conn, r["id"], Path(r["root_path"]), r["kind"])
+        print(f"Scanning {r['name']} at {r['root_path']} ...")
+        result = scanner.scan_library(conn, r["id"], Path(r["root_path"]))
         print(
             f"  movies={result.movies_added} shows={result.shows_added} "
             f"episodes={result.episodes_added} audiobooks={result.audiobooks_added} "
@@ -296,10 +296,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("init-db", help="Create the SQLite schema.")
     p.set_defaults(func=cmd_init_db)
 
-    p = sub.add_parser("add-library", help="Register a library root.")
+    p = sub.add_parser("add-library", help="Register a library root (folder of media).")
     p.add_argument("name")
     p.add_argument("root")
-    p.add_argument("--kind", required=True, choices=("movies", "tv", "audiobooks"))
     p.set_defaults(func=cmd_add_library)
 
     p = sub.add_parser("list-libraries", help="List registered libraries.")

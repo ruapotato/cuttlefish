@@ -1,18 +1,19 @@
 """Library scanner — walks the filesystem and populates the DB.
 
-Detection rules (per design memos):
+A library is just a folder. Cuttlefish decides what each subfolder is by
+looking at its contents. There's no per-library "kind" setting; one library
+can contain movies and TV shows and audiobooks side by side.
 
-- Movies library: a top-level entry that is a video file is a loose movie;
-  a top-level directory containing video files is a movie folder (clean
-  layout). Everything else is skipped.
-- TV library: top-level dir = show; inside, season folders match
-  S\\d+ / Season \\d+ / Season \\d+; inside seasons, video files are episodes
-  with S\\d+E\\d+ marker parsed when present.
-- Audiobooks library: recursive — any folder with direct audio file children
-  is a *book*; otherwise descend into its subfolders. Branches resolve
-  independently, supporting arbitrary depth.
+Per-folder classification rules:
 
-The scanner is read-only against the filesystem.
+  loose video file at the library root        → movie
+  folder with audio files in it directly      → audiobook (one book)
+  folder with video files in it directly      → movie (extras subdirs OK)
+  folder containing only subfolders:
+    subfolders contain audio                  → audiobook series; recurse
+    otherwise                                 → TV show; subfolders are seasons
+
+Each subfolder is classified independently — a library can mix all kinds.
 """
 from __future__ import annotations
 
@@ -30,6 +31,61 @@ POSTER_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 _SEASON_DIR = re.compile(r"^(?:s|season)\s*(\d{1,3})$", re.IGNORECASE)
 _EP_MARKER = re.compile(r"s(\d{1,3})e(\d{1,3})", re.IGNORECASE)
+
+
+@dataclass
+class ScanResult:
+    movies_added: int = 0
+    shows_added: int = 0
+    episodes_added: int = 0
+    audiobooks_added: int = 0
+    tracks_added: int = 0
+    skipped: int = 0
+
+    def merge(self, other: "ScanResult") -> None:
+        self.movies_added += other.movies_added
+        self.shows_added += other.shows_added
+        self.episodes_added += other.episodes_added
+        self.audiobooks_added += other.audiobooks_added
+        self.tracks_added += other.tracks_added
+        self.skipped += other.skipped
+
+
+def is_video(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTS
+
+
+def is_audio(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in AUDIO_EXTS
+
+
+# --- helpers --------------------------------------------------------------
+
+
+def _iter_visible(folder: Path):
+    if not folder.is_dir():
+        return
+    for entry in sorted(folder.iterdir(), key=lambda p: p.name):
+        if entry.name.startswith("."):
+            continue
+        yield entry
+
+
+def _direct_children(folder: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    """Return (videos, audios, subdirs) that are direct visible children."""
+    videos: list[Path] = []
+    audios: list[Path] = []
+    subdirs: list[Path] = []
+    for c in _iter_visible(folder):
+        if c.is_file():
+            ext = c.suffix.lower()
+            if ext in VIDEO_EXTS:
+                videos.append(c)
+            elif ext in AUDIO_EXTS:
+                audios.append(c)
+        elif c.is_dir():
+            subdirs.append(c)
+    return videos, audios, subdirs
 
 
 def _find_poster_for(path: Path) -> Path | None:
@@ -68,55 +124,73 @@ def _find_poster_for(path: Path) -> Path | None:
     return images[0]
 
 
-@dataclass
-class ScanResult:
-    movies_added: int = 0
-    shows_added: int = 0
-    episodes_added: int = 0
-    audiobooks_added: int = 0
-    tracks_added: int = 0
-    skipped: int = 0
-
-    def merge(self, other: "ScanResult") -> None:
-        self.movies_added += other.movies_added
-        self.shows_added += other.shows_added
-        self.episodes_added += other.episodes_added
-        self.audiobooks_added += other.audiobooks_added
-        self.tracks_added += other.tracks_added
-        self.skipped += other.skipped
+# --- per-folder classification -------------------------------------------
 
 
-def is_video(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in VIDEO_EXTS
+def classify_folder(folder: Path) -> str | None:
+    """Return one of: 'movie', 'audiobook', 'tv_show', 'audiobook_grouping',
+    or None if the folder doesn't contain media we can use.
+
+    Each subfolder of a library is classified independently, so one library
+    can mix movies, TV shows, and audiobooks freely.
+    """
+    videos, audios, subdirs = _direct_children(folder)
+    if audios:
+        return "audiobook"
+    if videos:
+        return "movie"
+    if not subdirs:
+        return None
+    # Folder contains only other folders. Recurse to find any media at all
+    # below this point. Audio anywhere in the tree → audiobook grouping.
+    has_audio = _tree_has_audio(folder)
+    has_video = _tree_has_video(folder)
+    if has_audio and not has_video:
+        return "audiobook_grouping"
+    return "tv_show"
 
 
-def is_audio(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in AUDIO_EXTS
+def _tree_has_audio(folder: Path, max_depth: int = 6) -> bool:
+    if max_depth < 0:
+        return False
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return False
+    for c in children:
+        if c.name.startswith("."):
+            continue
+        if c.is_file() and c.suffix.lower() in AUDIO_EXTS:
+            return True
+        if c.is_dir() and _tree_has_audio(c, max_depth - 1):
+            return True
+    return False
 
 
-def scan_library(
-    conn: sqlite3.Connection, library_id: int, root: Path, kind: str
-) -> ScanResult:
-    if not root.is_dir():
-        raise ValueError(f"library root not found or not a directory: {root}")
-    if kind == "movies":
-        return _scan_movies(conn, library_id, root)
-    if kind == "tv":
-        return _scan_tv(conn, library_id, root)
-    if kind == "audiobooks":
-        return _scan_audiobooks(conn, library_id, root)
-    raise ValueError(f"unknown library kind: {kind!r}")
+def _tree_has_video(folder: Path, max_depth: int = 6) -> bool:
+    if max_depth < 0:
+        return False
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return False
+    for c in children:
+        if c.name.startswith("."):
+            continue
+        if c.is_file() and c.suffix.lower() in VIDEO_EXTS:
+            return True
+        if c.is_dir() and _tree_has_video(c, max_depth - 1):
+            return True
+    return False
+
+
+# --- DB writers ----------------------------------------------------------
 
 
 def _upsert_media(
-    conn: sqlite3.Connection,
-    library_id: int,
-    kind: str,
-    source_path: Path,
-    title: str,
-    *,
-    poster_path: Path | None = None,
-    duration_seconds: float | None = None,
+    conn: sqlite3.Connection, library_id: int, kind: str,
+    source_path: Path, title: str, *,
+    poster_path: Path | None = None, duration_seconds: float | None = None,
 ) -> int:
     with conn:
         conn.execute(
@@ -125,9 +199,9 @@ def _upsert_media(
                                poster_path, duration_seconds)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(library_id, source_path) DO UPDATE SET
-                last_seen_at = CURRENT_TIMESTAMP,
-                title_guess  = excluded.title_guess,
-                poster_path  = COALESCE(excluded.poster_path, media.poster_path),
+                last_seen_at     = CURRENT_TIMESTAMP,
+                title_guess      = excluded.title_guess,
+                poster_path      = COALESCE(excluded.poster_path, media.poster_path),
                 duration_seconds = COALESCE(excluded.duration_seconds, media.duration_seconds)
             """,
             (
@@ -136,144 +210,149 @@ def _upsert_media(
                 duration_seconds,
             ),
         )
-    row = conn.execute(
+    return conn.execute(
         "SELECT id FROM media WHERE library_id = ? AND source_path = ?",
         (library_id, str(source_path)),
-    ).fetchone()
-    return row["id"]
+    ).fetchone()["id"]
 
 
-def _resolve_video_for_probe(source_path: Path) -> Path | None:
-    """Pick a video file to ffprobe. For loose movies it's the file; for
-    folder-source movies it's the first video inside."""
-    if source_path.is_file() and source_path.suffix.lower() in VIDEO_EXTS:
-        return source_path
-    if source_path.is_dir():
-        for child in sorted(source_path.iterdir()):
-            if child.is_file() and child.suffix.lower() in VIDEO_EXTS:
-                return child
-    return None
+def _add_movie(conn: sqlite3.Connection, library_id: int, source: Path,
+               result: ScanResult) -> None:
+    title = title_from_filename(source.name)
+    poster = _find_poster_for(source)
+    if source.is_file():
+        duration = get_duration(source)
+    else:
+        videos, _, _ = _direct_children(source)
+        duration = get_duration(videos[0]) if videos else None
+    _upsert_media(conn, library_id, "movie", source, title,
+                  poster_path=poster, duration_seconds=duration)
+    result.movies_added += 1
 
 
-def _iter_visible(folder: Path):
-    for entry in sorted(folder.iterdir(), key=lambda p: p.name):
-        if entry.name.startswith("."):
+def _add_audiobook(conn: sqlite3.Connection, library_id: int, folder: Path,
+                   result: ScanResult) -> None:
+    title = title_from_filename(folder.name)
+    poster = _find_poster_for(folder)
+    book_id = _upsert_media(conn, library_id, "audiobook", folder, title,
+                            poster_path=poster)
+    result.audiobooks_added += 1
+    _, audios, _ = _direct_children(folder)
+    for idx, track in enumerate(sorted(audios, key=lambda p: p.name)):
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO audiobook_tracks (book_id, order_index, source_path)
+                VALUES (?, ?, ?)
+                ON CONFLICT(book_id, source_path) DO UPDATE SET
+                    order_index  = excluded.order_index,
+                    last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (book_id, idx, str(track)),
+            )
+        result.tracks_added += 1
+
+
+def _add_show(conn: sqlite3.Connection, library_id: int, show_dir: Path,
+              result: ScanResult) -> None:
+    """A TV show folder contains season subfolders. We support:
+       - Season-pattern subdirs ('Season 01', 'S2', 'Season 3')
+       - Other subdirs treated as season 1, season 2, ... in iteration order
+    """
+    title = title_from_filename(show_dir.name)
+    poster = _find_poster_for(show_dir)
+    show_id = _upsert_media(conn, library_id, "tv_show", show_dir, title,
+                            poster_path=poster)
+    result.shows_added += 1
+    # Discover seasons
+    season_entries: list[tuple[int, Path]] = []
+    fallback_index = 1
+    for sub in _iter_visible(show_dir):
+        if not sub.is_dir():
             continue
-        yield entry
+        m = _SEASON_DIR.match(sub.name)
+        if m:
+            season_entries.append((int(m.group(1)), sub))
+        else:
+            season_entries.append((fallback_index, sub))
+            fallback_index += 1
+    for season_num, season_dir in season_entries:
+        for ep_file in _iter_visible(season_dir):
+            if not is_video(ep_file):
+                continue
+            em = _EP_MARKER.search(ep_file.name)
+            episode_num = int(em.group(2)) if em else 0
+            ep_title = title_from_filename(ep_file.name)
+            ep_poster = _find_poster_for(ep_file)
+            ep_dur = get_duration(ep_file)
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO tv_episodes (show_id, season, episode, source_path,
+                                             title_guess, poster_path, duration_seconds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(show_id, source_path) DO UPDATE SET
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        season       = excluded.season,
+                        episode      = excluded.episode,
+                        title_guess  = excluded.title_guess,
+                        poster_path  = COALESCE(excluded.poster_path, tv_episodes.poster_path),
+                        duration_seconds = COALESCE(excluded.duration_seconds, tv_episodes.duration_seconds)
+                    """,
+                    (
+                        show_id, season_num, episode_num, str(ep_file), ep_title,
+                        str(ep_poster) if ep_poster else None,
+                        ep_dur,
+                    ),
+                )
+            result.episodes_added += 1
 
 
-def _scan_movies(conn: sqlite3.Connection, library_id: int, root: Path) -> ScanResult:
+def _walk_audiobook_grouping(
+    conn: sqlite3.Connection, library_id: int, folder: Path,
+    result: ScanResult,
+) -> None:
+    """Folder of folders containing audio: each subfolder is a book.
+    Recurses to handle Author/Series/Book/chapter.mp3 layouts."""
+    for sub in _iter_visible(folder):
+        if not sub.is_dir():
+            continue
+        cls = classify_folder(sub)
+        if cls == "audiobook":
+            _add_audiobook(conn, library_id, sub, result)
+        elif cls == "audiobook_grouping":
+            _walk_audiobook_grouping(conn, library_id, sub, result)
+
+
+# --- main entry point ----------------------------------------------------
+
+
+def scan_library(
+    conn: sqlite3.Connection, library_id: int, root: Path,
+) -> ScanResult:
+    """Walk the library root, classifying each top-level entry independently."""
+    if not root.is_dir():
+        raise ValueError(f"library root not found or not a directory: {root}")
     result = ScanResult()
     for entry in _iter_visible(root):
-        if is_video(entry):
-            title = title_from_filename(entry.name)
-            poster = _find_poster_for(entry)
-            duration = get_duration(entry)
-            _upsert_media(conn, library_id, "movie", entry, title,
-                          poster_path=poster, duration_seconds=duration)
-            result.movies_added += 1
-        elif entry.is_dir():
-            videos = [c for c in entry.iterdir() if is_video(c)]
-            if videos:
-                title = title_from_filename(entry.name)
-                poster = _find_poster_for(entry)
-                duration = get_duration(videos[0])
-                _upsert_media(conn, library_id, "movie", entry, title,
-                              poster_path=poster, duration_seconds=duration)
-                result.movies_added += 1
+        if entry.is_file():
+            if is_video(entry):
+                _add_movie(conn, library_id, entry, result)
             else:
                 result.skipped += 1
-        else:
-            result.skipped += 1
-    return result
-
-
-def _scan_tv(conn: sqlite3.Connection, library_id: int, root: Path) -> ScanResult:
-    result = ScanResult()
-    for show_dir in _iter_visible(root):
-        if not show_dir.is_dir():
+            continue
+        if not entry.is_dir():
             result.skipped += 1
             continue
-        title = title_from_filename(show_dir.name)
-        show_poster = _find_poster_for(show_dir)
-        show_id = _upsert_media(conn, library_id, "tv_show", show_dir, title,
-                                poster_path=show_poster)
-        result.shows_added += 1
-        for season_dir in _iter_visible(show_dir):
-            if not season_dir.is_dir():
-                continue
-            m = _SEASON_DIR.match(season_dir.name)
-            if not m:
-                continue
-            season_num = int(m.group(1))
-            for ep_file in _iter_visible(season_dir):
-                if not is_video(ep_file):
-                    continue
-                em = _EP_MARKER.search(ep_file.name)
-                episode_num = int(em.group(2)) if em else 0
-                ep_title = title_from_filename(ep_file.name)
-                ep_poster = _find_poster_for(ep_file)
-                ep_dur = get_duration(ep_file)
-                with conn:
-                    conn.execute(
-                        """
-                        INSERT INTO tv_episodes (show_id, season, episode, source_path,
-                                                 title_guess, poster_path, duration_seconds)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(show_id, source_path) DO UPDATE SET
-                            last_seen_at = CURRENT_TIMESTAMP,
-                            season       = excluded.season,
-                            episode      = excluded.episode,
-                            title_guess  = excluded.title_guess,
-                            poster_path  = COALESCE(excluded.poster_path, tv_episodes.poster_path),
-                            duration_seconds = COALESCE(excluded.duration_seconds, tv_episodes.duration_seconds)
-                        """,
-                        (
-                            show_id, season_num, episode_num, str(ep_file), ep_title,
-                            str(ep_poster) if ep_poster else None,
-                            ep_dur,
-                        ),
-                    )
-                result.episodes_added += 1
-    return result
-
-
-def _scan_audiobooks(
-    conn: sqlite3.Connection, library_id: int, root: Path
-) -> ScanResult:
-    result = ScanResult()
-
-    def walk(folder: Path) -> None:
-        if folder.name.startswith("."):
-            return
-        children = list(folder.iterdir())
-        audio_children = sorted(
-            (c for c in children if is_audio(c)), key=lambda p: p.name
-        )
-        if audio_children:
-            title = title_from_filename(folder.name)
-            book_poster = _find_poster_for(folder)
-            book_id = _upsert_media(conn, library_id, "audiobook", folder, title,
-                                    poster_path=book_poster)
-            result.audiobooks_added += 1
-            for idx, track in enumerate(audio_children):
-                with conn:
-                    conn.execute(
-                        """
-                        INSERT INTO audiobook_tracks (book_id, order_index, source_path)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(book_id, source_path) DO UPDATE SET
-                            order_index  = excluded.order_index,
-                            last_seen_at = CURRENT_TIMESTAMP
-                        """,
-                        (book_id, idx, str(track)),
-                    )
-                result.tracks_added += 1
-            return
-        for sub in sorted((c for c in children if c.is_dir()), key=lambda p: p.name):
-            walk(sub)
-
-    for top in _iter_visible(root):
-        if top.is_dir():
-            walk(top)
+        classification = classify_folder(entry)
+        if classification == "movie":
+            _add_movie(conn, library_id, entry, result)
+        elif classification == "audiobook":
+            _add_audiobook(conn, library_id, entry, result)
+        elif classification == "tv_show":
+            _add_show(conn, library_id, entry, result)
+        elif classification == "audiobook_grouping":
+            _walk_audiobook_grouping(conn, library_id, entry, result)
+        else:
+            result.skipped += 1
     return result

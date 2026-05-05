@@ -27,11 +27,11 @@ def tv_db(tmp_path: Path):
     db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-            ("tv", "tv", str(root)),
+            "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+            ("tv", str(root)),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "tv")
+    scanner.scan_library(conn, lib_id, root)
     show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
     return db_path, show_id
 
@@ -50,11 +50,11 @@ def book_db(tmp_path: Path):
     db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-            ("books", "audiobooks", str(root)),
+            "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+            ("books", str(root)),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "audiobooks")
+    scanner.scan_library(conn, lib_id, root)
     book_id = conn.execute("SELECT id FROM media WHERE kind='audiobook'").fetchone()["id"]
     return db_path, book_id
 
@@ -188,11 +188,11 @@ def test_book_progress_rejects_track_from_other_book(book_db, tmp_path):
     (other_root / "Other" / "01.mp3").write_bytes(b"x" * 10)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('other','audiobooks',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('other', ?)",
             (str(other_root),),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, other_root, "audiobooks")
+    scanner.scan_library(conn, lib_id, other_root)
     other_track = conn.execute(
         "SELECT t.id FROM audiobook_tracks t JOIN media m ON m.id = t.book_id "
         "WHERE m.library_id = ?", (lib_id,)

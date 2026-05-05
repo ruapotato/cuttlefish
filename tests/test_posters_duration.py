@@ -65,10 +65,10 @@ def test_scan_picks_up_movie_poster_sidecar(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     row = conn.execute("SELECT poster_path FROM media").fetchone()
     assert row["poster_path"] is not None
     assert Path(row["poster_path"]).name == "Movie.jpg"
@@ -85,10 +85,10 @@ def test_scan_picks_up_show_poster(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     show_row = conn.execute("SELECT poster_path FROM media WHERE kind='tv_show'").fetchone()
     assert Path(show_row["poster_path"]).name == "poster.jpg"
 
@@ -103,10 +103,10 @@ def test_scan_picks_up_audiobook_cover(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('b','audiobooks',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('b', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "audiobooks")
+    scanner.scan_library(conn, cur.lastrowid, root)
     row = conn.execute("SELECT poster_path FROM media WHERE kind='audiobook'").fetchone()
     assert Path(row["poster_path"]).name == "cover.jpg"
 
@@ -119,10 +119,10 @@ def test_scan_no_poster_yields_null(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     row = conn.execute("SELECT poster_path FROM media").fetchone()
     assert row["poster_path"] is None
 
@@ -140,10 +140,10 @@ def test_poster_endpoint_serves_image(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     r = client.get(f"/poster/{media_id}")
@@ -159,10 +159,10 @@ def test_poster_endpoint_404_when_missing(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     assert client.get(f"/poster/{media_id}").status_code == 404
@@ -177,10 +177,10 @@ def test_library_page_renders_poster_img_when_present(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     lib_id = conn.execute("SELECT id FROM libraries").fetchone()["id"]
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
@@ -197,10 +197,10 @@ def test_library_page_no_poster_renders_placeholder(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     lib_id = conn.execute("SELECT id FROM libraries").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     r = client.get(f"/library/{lib_id}")
@@ -218,10 +218,10 @@ def test_show_page_includes_poster_header(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     r = client.get(f"/show/{show_id}")
@@ -242,10 +242,10 @@ def test_scan_records_duration_for_real_video(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     row = conn.execute("SELECT duration_seconds FROM media").fetchone()
     assert row["duration_seconds"] is not None
     assert 1.5 < row["duration_seconds"] < 3.0
@@ -260,10 +260,10 @@ def test_scan_records_episode_duration_and_show_page_displays_it(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     r = client.get(f"/show/{show_id}")

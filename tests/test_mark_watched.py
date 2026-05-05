@@ -18,10 +18,10 @@ def _setup(tmp_path: Path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "movies")
+    scanner.scan_library(conn, cur.lastrowid, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     # Manually set duration since the empty file wasn't probed
     with conn:
@@ -75,10 +75,10 @@ def test_delete_episode_progress(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root, "tv")
+    scanner.scan_library(conn, cur.lastrowid, root)
     ep_id = conn.execute("SELECT id FROM tv_episodes").fetchone()["id"]
     client = _logged_in(db_path)
     client.put(f"/api/progress/episode/{ep_id}", json={"position_seconds": 30.0})

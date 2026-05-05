@@ -41,7 +41,6 @@ class CruftDeleteBody(BaseModel):
 
 class LibraryCreateBody(BaseModel):
     name: str
-    kind: str
     root_path: str
 
 
@@ -108,7 +107,7 @@ def create_app(
     @app.get("/api/libraries")
     def api_libraries():
         rows = _conn().execute(
-            "SELECT id, name, kind, root_path, created_at FROM libraries ORDER BY id"
+            "SELECT id, name, root_path, created_at FROM libraries ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -683,17 +682,14 @@ def create_app(
     @app.post("/api/admin/libraries")
     def api_admin_create_library(body: LibraryCreateBody, request: Request):
         _require_admin(request)
-        from cuttlefish.config import VALID_KINDS
-        if body.kind not in VALID_KINDS:
-            raise HTTPException(400, f"kind must be one of {VALID_KINDS}")
         root = Path(body.root_path).expanduser()
         if not root.is_dir():
             raise HTTPException(400, f"root path is not a directory: {root}")
         try:
             with _conn() as conn:
                 cur = conn.execute(
-                    "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-                    (body.name, body.kind, str(root.resolve())),
+                    "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+                    (body.name, str(root.resolve())),
                 )
             return {"ok": True, "id": cur.lastrowid}
         except sqlite3.IntegrityError as e:
@@ -714,11 +710,11 @@ def create_app(
         from cuttlefish import scanner as scn
         conn = _conn()
         row = conn.execute(
-            "SELECT root_path, kind FROM libraries WHERE id = ?", (library_id,)
+            "SELECT root_path FROM libraries WHERE id = ?", (library_id,)
         ).fetchone()
         if row is None:
             raise HTTPException(404, "library not found")
-        result = scn.scan_library(conn, library_id, Path(row["root_path"]), row["kind"])
+        result = scn.scan_library(conn, library_id, Path(row["root_path"]))
         return {
             "ok": True,
             "movies_added": result.movies_added,
@@ -734,12 +730,12 @@ def create_app(
         _require_admin(request)
         from cuttlefish import scanner as scn
         conn = _conn()
-        rows = conn.execute("SELECT id, root_path, kind FROM libraries").fetchall()
+        rows = conn.execute("SELECT id, root_path FROM libraries").fetchall()
         total = scn.ScanResult()
         for r in rows:
             try:
-                total.merge(scn.scan_library(conn, r["id"], Path(r["root_path"]), r["kind"]))
-            except Exception as e:
+                total.merge(scn.scan_library(conn, r["id"], Path(r["root_path"])))
+            except Exception:
                 # Don't break the loop on one bad library
                 continue
         return {
@@ -757,7 +753,7 @@ def create_app(
     def page_admin_libraries(request: Request):
         user = _require_admin(request)
         rows = _conn().execute(
-            "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
+            "SELECT id, name, root_path FROM libraries ORDER BY id"
         ).fetchall()
         if not rows:
             list_html = "<p class='empty'>No libraries yet.</p>"
@@ -766,7 +762,6 @@ def create_app(
                 f"<tr>"
                 f"<td>{r['id']}</td>"
                 f"<td>{html.escape(r['name'])}</td>"
-                f"<td>{r['kind']}</td>"
                 f"<td><code>{html.escape(r['root_path'])}</code></td>"
                 f"<td>"
                 f"<form method='post' action='/admin/libraries/{r['id']}/scan' style='display:inline'>"
@@ -780,7 +775,7 @@ def create_app(
             )
             list_html = (
                 "<table class='admin'><thead><tr>"
-                "<th>id</th><th>name</th><th>kind</th><th>root</th><th></th>"
+                "<th>id</th><th>name</th><th>root</th><th></th>"
                 "</tr></thead><tbody>"
                 f"{row_html}</tbody></table>"
                 "<form method='post' action='/admin/libraries/scan-all' style='margin-top:1rem'>"
@@ -788,18 +783,14 @@ def create_app(
             )
         body = f"""
 <h2>Libraries</h2>
+<p class='hint'>A library is just a folder. Cuttlefish figures out what each
+subfolder is — a movie, a TV show, an audiobook — by looking at it. One
+library can contain all kinds of media, mixed.</p>
 {list_html}
 <h3>Add a library</h3>
 <form method='post' action='/admin/libraries' class='auth'>
-  <label>Name <input name='name' required></label>
-  <label>Kind
-    <select name='kind' required>
-      <option value='movies'>Movies</option>
-      <option value='tv'>TV</option>
-      <option value='audiobooks'>Audiobooks</option>
-    </select>
-  </label>
-  <label>Root path <input name='root_path' placeholder='/data/Movies' required></label>
+  <label>Name <input name='name' required placeholder='e.g. Media'></label>
+  <label>Root path <input name='root_path' placeholder='/data/Media' required></label>
   <button type='submit'>Add</button>
 </form>
 <p><a href='/admin'>&larr; Admin</a></p>
@@ -810,21 +801,17 @@ def create_app(
     def page_admin_libraries_add(
         request: Request,
         name: str = Form(...),
-        kind: str = Form(...),
         root_path: str = Form(...),
     ):
         _require_admin(request)
-        from cuttlefish.config import VALID_KINDS
-        if kind not in VALID_KINDS:
-            raise HTTPException(400, f"kind must be one of {VALID_KINDS}")
         root = Path(root_path).expanduser()
         if not root.is_dir():
             raise HTTPException(400, f"root path is not a directory: {root}")
         try:
             with _conn() as conn:
                 conn.execute(
-                    "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-                    (name, kind, str(root.resolve())),
+                    "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+                    (name, str(root.resolve())),
                 )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "library name or root already exists")
@@ -1330,7 +1317,7 @@ def create_app(
     def page_index(request: Request):
         user = _current_user(request)
         rows = _conn().execute(
-            "SELECT id, name, kind, root_path FROM libraries ORDER BY id"
+            "SELECT id, name, root_path FROM libraries ORDER BY id"
         ).fetchall()
         if not rows:
             if user and user["is_admin"]:
@@ -1352,8 +1339,7 @@ def create_app(
                 )
         else:
             items = "".join(
-                f"<li><a href='/library/{r['id']}'>{html.escape(r['name'])}</a> "
-                f"<span class='kind'>{r['kind']}</span></li>"
+                f"<li><a href='/library/{r['id']}'>{html.escape(r['name'])}</a></li>"
                 for r in rows
             )
             body = f"<ul class='libraries'>{items}</ul>"
@@ -1364,27 +1350,28 @@ def create_app(
         user = _current_user(request)
         conn = _conn()
         lib = conn.execute(
-            "SELECT id, name, kind FROM libraries WHERE id = ?", (library_id,)
+            "SELECT id, name FROM libraries WHERE id = ?", (library_id,)
         ).fetchone()
         if not lib:
             raise HTTPException(404, "library not found")
         media = conn.execute(
             "SELECT id, kind, title_guess, poster_path FROM media WHERE library_id = ? "
-            "ORDER BY title_guess",
+            "ORDER BY kind, title_guess",
             (library_id,),
         ).fetchall()
         if not media:
-            body = "<p class='empty'>No media yet. Run <code>uv run cuttlefish scan</code>.</p>"
+            body = "<p class='empty'>No media yet. Use <strong>Scan</strong> on this library in /admin/libraries.</p>"
         else:
             items = "".join(
                 f"<li class='card'><a href='{_watch_url(m['kind'], m['id'])}'>"
                 + (f"<img src='/poster/{m['id']}' alt=''>" if m['poster_path'] else "<div class='no-poster'></div>")
                 + f"<span class='card-title'>{html.escape(m['title_guess'])}</span>"
+                + f"<span class='card-kind'>{_kind_label(m['kind'])}</span>"
                 "</a></li>"
                 for m in media
             )
             body = f"<ul class='cards'>{items}</ul>"
-        return _page(f"{lib['name']} ({lib['kind']})", body, user=user)
+        return _page(lib['name'], body, user=user)
 
     @app.get("/watch/{media_id}", response_class=HTMLResponse)
     def page_watch(media_id: int, request: Request):
@@ -2096,8 +2083,9 @@ ul.cards li.card img, ul.cards li.card .no-poster {
     width: 100%; aspect-ratio: 2 / 3; object-fit: cover;
     background: #222; border-radius: 4px; display: block;
 }
-ul.cards li.card .card-title { display: block; font-size: .9em; padding: .4rem 0;
+ul.cards li.card .card-title { display: block; font-size: .9em; padding: .4rem 0 0;
                                 color: #eee; line-height: 1.2; }
+ul.cards li.card .card-kind { display: block; font-size: .75em; color: #888; }
 img.show-poster { max-width: 200px; max-height: 300px; float: right;
                    margin: 0 0 1rem 1rem; border-radius: 4px; }
 form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
@@ -2158,6 +2146,10 @@ def _human_size(n: Optional[int]) -> str:
             return f"{f:.1f} {u}" if u != "B" else f"{int(f)} B"
         f /= 1024
     return f"{int(n)} B"
+
+
+def _kind_label(kind: str) -> str:
+    return {"movie": "Movie", "tv_show": "TV Show", "audiobook": "Audiobook"}.get(kind, kind)
 
 
 def _watch_url(kind: str, media_id: int) -> str:

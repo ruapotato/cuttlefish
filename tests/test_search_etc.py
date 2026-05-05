@@ -75,10 +75,10 @@ def _setup_movie_with_sidecar(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-        scanner.scan_library(conn, cur.lastrowid, root, "movies")
+        scanner.scan_library(conn, cur.lastrowid, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     return db_path, media_id
 
@@ -101,10 +101,10 @@ def test_subtitle_endpoint_404_when_no_sidecar(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('m','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
             (str(root),),
         )
-        scanner.scan_library(conn, cur.lastrowid, root, "movies")
+        scanner.scan_library(conn, cur.lastrowid, root)
     media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
     assert client.get(f"/subtitle/{media_id}").status_code == 404
@@ -136,15 +136,15 @@ def _populate_for_search(tmp_path):
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         m = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('movies','movies',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('movies', ?)",
             (str(movies),),
         ); m_lib = m.lastrowid
         t = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES ('tv','tv',?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
             (str(tv),),
         ); t_lib = t.lastrowid
-    scanner.scan_library(conn, m_lib, movies, "movies")
-    scanner.scan_library(conn, t_lib, tv, "tv")
+    scanner.scan_library(conn, m_lib, movies)
+    scanner.scan_library(conn, t_lib, tv)
     return db_path
 
 

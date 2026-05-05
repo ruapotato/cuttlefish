@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -18,7 +18,6 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS libraries (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         name       TEXT    NOT NULL UNIQUE,
-        kind       TEXT    NOT NULL CHECK(kind IN ('movies','tv','audiobooks')),
         root_path  TEXT    NOT NULL UNIQUE,
         created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -174,6 +173,32 @@ ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _migrate_libraries_drop_kind(conn: sqlite3.Connection) -> None:
+    """v6→v7: drop the `kind` column from `libraries`. Cuttlefish now decides
+    what each subfolder is by looking at it, so the library no longer has a
+    type. SQLite ALTER TABLE DROP COLUMN exists in 3.35+, but using the
+    recreate pattern here works on every SQLite version we support."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'libraries' AND type = 'table'"
+    ).fetchone()
+    if row is None or " kind " not in (row["sql"] or ""):
+        return  # column already absent
+    conn.execute("""
+        CREATE TABLE libraries_new (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL UNIQUE,
+            root_path  TEXT    NOT NULL UNIQUE,
+            created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "INSERT INTO libraries_new (id, name, root_path, created_at) "
+        "SELECT id, name, root_path, created_at FROM libraries"
+    )
+    conn.execute("DROP TABLE libraries")
+    conn.execute("ALTER TABLE libraries_new RENAME TO libraries")
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     with conn:
         for stmt in SCHEMA_STATEMENTS:
@@ -183,6 +208,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_decl}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        _migrate_libraries_drop_kind(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
             ("schema_version", str(SCHEMA_VERSION)),

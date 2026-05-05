@@ -21,11 +21,11 @@ def populated_db(tmp_path: Path):
     db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, kind, root_path) VALUES (?, ?, ?)",
-            ("movies", "movies", str(root)),
+            "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
+            ("movies", str(root)),
         )
         lib_id = cur.lastrowid
-    scanner.scan_library(conn, lib_id, root, "movies")
+    scanner.scan_library(conn, lib_id, root)
     return db_path
 
 
