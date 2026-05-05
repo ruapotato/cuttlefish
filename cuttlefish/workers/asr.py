@@ -184,6 +184,9 @@ def transcribe_to_srt(
             "Install with: uv sync --extra asr"
         )
     _force_cpu_if_cuda_broken()
+    import numpy as np  # type: ignore
+    import soundfile as sf  # type: ignore
+    import torch  # type: ignore
     import nemo.collections.asr as nemo_asr  # type: ignore
 
     with tempfile.TemporaryDirectory() as td:
@@ -203,13 +206,24 @@ def transcribe_to_srt(
                     "`--asr-cpu` to start.sh) to run on CPU instead."
                 ) from e
             raise
-        log.info("transcribing %s", video_path)
-        # NeMo's transcribe API varies by version. We try the newer kw, then
-        # fall back to the older positional form.
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        log.info("loaded Parakeet on %s; transcribing %s", device, video_path)
+
+        # Load the audio into a NumPy array and pass it directly. This skips
+        # NeMo's Lhotse dataloader path, which spins up subprocess workers
+        # that hang silently when the worker thread is a Python daemon
+        # thread (the embedded --with-asr-worker case).
+        audio_data, _sr = sf.read(str(wav))
+        if audio_data.ndim > 1:
+            audio_data = np.mean(audio_data, axis=-1)
+        audio_data = audio_data.astype(np.float32)
+
         try:
-            results = model.transcribe([str(wav)], timestamps=True)
+            results = model.transcribe([audio_data], timestamps=True)
         except TypeError:
-            results = model.transcribe([str(wav)])
+            results = model.transcribe([audio_data])
         words = _extract_words_from_nemo_result(results)
         cues = words_to_cues(words)
         output_srt.parent.mkdir(parents=True, exist_ok=True)
