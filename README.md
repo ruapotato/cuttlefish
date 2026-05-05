@@ -5,20 +5,23 @@ laptop, or your smart TV's built-in browser. Pre-encodes your library to a
 single compatible format instead of transcoding on the fly.
 
 > **Status: works end-to-end.** Scan, encode, watch with captions, resume,
-> cast between devices. Tested with 218 unit + integration tests against
-> real ffmpeg. See "What's not implemented yet" at the bottom for the
-> short list of gaps.
+> cast between devices. 247 unit + integration tests run on every push,
+> including real ffmpeg encode/probe/thumbnail flows. See "What's not
+> implemented yet" at the bottom for the short list of gaps.
 
 ## What you get
 
 - **One-shot pre-encoding** to H.264/AAC/MP4 1080p — every modern device
   plays directly, no on-the-fly transcoding.
-- **Scanner** that auto-detects movies vs TV shows vs audiobooks from
-  folder structure, picks up sidecar posters and subtitles, probes
-  duration with ffprobe.
-- **Web UI** that runs on smart TV browsers (no JS framework, server-rendered
-  HTML), with poster grid, search, "Continue Watching", browser-native
-  captions via WebVTT.
+- **Scanner** that decides what each subfolder is — movie / TV show /
+  audiobook — by looking at it. One library can mix everything.
+- **Auto-generated thumbnails**: any video without a sidecar JPG gets a
+  poster extracted from a frame ~5 minutes in, cached on disk.
+- **Merged web UI**: the home page shows every item from every library,
+  organized into Movies / TV Shows / Audiobooks sections. No JS framework,
+  works on smart TV browsers, browser-native WebVTT captions.
+- **Theater-mode watch page** that autoplays. First click on the page
+  enters browser fullscreen; double-click on the video toggles it back.
 - **User accounts** with per-user resume across movies, TV episodes, and
   audiobook chapters.
 - **Multi-device casting** — log into the same account on the TV and your
@@ -132,11 +135,25 @@ members. Each gets their own per-user resume positions and casting state.
 
 Go to `/` — you'll see all of your media merged into one page,
 organized into **Movies / TV Shows / Audiobooks** sections. Every
-library you've added contributes to those sections. Click any title and
-it plays in the browser. Captions appear automatically if a `.srt`
-lives next to the video. Posters show up automatically if a sibling
-`.jpg` (or `poster.jpg` in a folder) exists; for any video that has
-neither, cuttlefish extracts a frame ~5 minutes in and uses that.
+library you've added contributes to those sections.
+
+Click any title:
+
+- The watch page opens in **theater mode** — video stretches to most of
+  the viewport, dark background.
+- Playback **starts automatically**. If your browser blocks
+  autoplay-with-sound, the picture starts muted; click anywhere to
+  unmute.
+- That same first click also drops the page into **browser fullscreen**.
+  Double-click the video to toggle back. (Browsers don't allow
+  fullscreen-on-load without a user gesture, even Jellyfin requires
+  the same one click.)
+- **Captions** load automatically if a `.srt` lives next to the video.
+- **Posters** show up automatically if a sibling `.jpg` (or `poster.jpg`
+  in a folder) exists; for any video that has neither, cuttlefish
+  extracts a frame ~5 minutes in and uses that.
+- Your **resume position** is saved every few seconds; reopen the same
+  movie/episode/book later and it picks up where you left off.
 
 That's it. **Everything else below is optional**, and everything from
 this point on is doable from the web UI — you don't need to drop back to
@@ -296,8 +313,8 @@ See [docs/casting.md](docs/casting.md) for design notes.
 
 | URL | What |
 |---|---|
-| `/` | Library index, poster grid |
-| `/library/{id}` | Items in one library |
+| `/` | Home — every item from every library, merged into Movies / TV Shows / Audiobooks sections with poster cards |
+| `/library/{id}` | Filter to one library (mostly useful for verifying what got picked up from a specific folder) |
 | `/show/{id}` | Episodes grouped by season |
 | `/book/{id}` | Audiobook chapter playlist with auto-advance |
 | `/watch/{id}` | Movie player (auto-redirects for shows/books) |
@@ -348,7 +365,7 @@ GET    /health
 
 ```bash
 uv sync --extra dev          # adds pytest + ruff
-uv run pytest -q             # 218 tests, ~25 seconds
+uv run pytest -q             # 247 tests, ~60 seconds (most of it real ffmpeg)
 uv run ruff check .
 ```
 
@@ -358,23 +375,24 @@ The codebase is organized as:
 
 ```
 cuttlefish/
-  __main__.py           CLI entry point
+  __main__.py           CLI entry point + bootstrap-admin banner
   db.py                 SQLite schema + idempotent migrations
-  scanner.py            filesystem walker
+  scanner.py            filesystem walker + per-folder auto-classification
   titles.py             filename → display title cleanup
-  probe.py              ffprobe wrapper
+  probe.py              ffprobe wrapper (duration)
+  thumbnails.py         frame-extracted poster thumbnails (cached)
   cruft.py              non-media file detection
   subtitles.py          SRT → WebVTT
   config.py             TOML loader
   tls.py                certbot wrapper
-  auth.py               scrypt + sessions
+  auth.py               scrypt + sessions + bootstrap admin
   clients/              tmdb, opensubtitles
   workers/              encoder, asr
   server/
-    app.py              FastAPI routes
+    app.py              FastAPI routes (HTML + JSON API + admin)
     streaming.py        HTTP range request handler
     cast.py             websocket pub/sub bus
-tests/                  one test file per module
+tests/                  one test file per module + conftest.py
 docs/                   tls, casting, configuration
 ```
 
