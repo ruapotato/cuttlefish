@@ -190,6 +190,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         else:
+            asr.mark_worker_started()
             t = threading.Thread(
                 target=asr.run_worker,
                 kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},
@@ -253,6 +254,7 @@ def cmd_asr_worker(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    asr.mark_worker_started()
     n = asr.run_worker(
         db_path=args.db, once=args.once, poll_interval=args.poll, ffmpeg=args.ffmpeg
     )
@@ -313,6 +315,9 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_list_media)
 
     p = sub.add_parser("serve", help="Run the cuttlefish web server.")
+    # Also accept --db here so it can come AFTER 'serve' on the command line.
+    # The top-level --db on the main parser still works for backward compat.
+    p.add_argument("--db", help="SQLite DB path (overrides top-level --db).")
     p.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     p.add_argument("--with-worker", action="store_true",

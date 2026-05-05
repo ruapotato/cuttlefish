@@ -723,7 +723,14 @@ def create_app(
     def api_admin_asr_status(request: Request):
         _require_admin(request)
         from cuttlefish.workers import asr as _asr
-        return {"available": _asr.is_available()}
+        pending = _conn().execute(
+            "SELECT COUNT(*) AS c FROM jobs WHERE kind='asr' AND status='queued'"
+        ).fetchone()["c"]
+        return {
+            "available": _asr.is_available(),
+            "worker_in_process": _asr.is_worker_in_process(),
+            "queued": pending,
+        }
 
     @app.post("/api/admin/encode/episode/{episode_id}")
     def api_admin_enqueue_episode_encode(episode_id: int, request: Request):
@@ -1303,20 +1310,37 @@ library can contain all kinds of media, mixed.</p>
             })
 
         asr_ok = _asr.is_available()
-        if asr_ok:
+        worker_running = _asr.is_worker_in_process()
+        # Also surface how many ASR jobs are currently sitting in the queue
+        asr_pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM jobs WHERE kind='asr' AND status='queued'"
+        ).fetchone()["c"]
+        pending_note = (
+            f" <strong>{asr_pending} ASR job(s) waiting in the queue right now.</strong>"
+            if asr_pending else ""
+        )
+        if not asr_ok:
             status_banner = (
-                "<p class='hint' style='color:#6c6'>"
-                "ASR worker dependencies are installed. Make sure you started "
-                "<code>serve --with-asr-worker</code> for queued jobs to actually run.</p>"
+                "<p class='error'><strong>ASR dependencies aren't installed.</strong> "
+                "Install them with <code>uv sync --extra asr</code> "
+                "(~2 GB of torch + nemo), then restart the server with "
+                "<code>uv run cuttlefish serve --with-worker --with-asr-worker</code>. "
+                "You can still queue jobs below; they'll be processed once a "
+                f"worker comes online.{pending_note}</p>"
+            )
+        elif not worker_running:
+            status_banner = (
+                "<p class='error'><strong>ASR is installed but no worker is "
+                "running in this server process.</strong> Restart with "
+                "<code>uv run cuttlefish serve --with-worker --with-asr-worker</code>, "
+                "or run <code>uv run cuttlefish asr-worker</code> in a separate "
+                f"terminal — queued jobs will start within a few seconds.{pending_note}</p>"
             )
         else:
             status_banner = (
-                "<p class='error'>ASR dependencies are <strong>not installed</strong>. "
-                "Install them with <code>uv sync --extra asr</code> "
-                "(~2 GB of torch + nemo) and restart the server with "
-                "<code>serve --with-worker --with-asr-worker</code>. "
-                "You can still queue jobs from this page; they'll be "
-                "processed once a worker comes online.</p>"
+                "<p class='hint' style='color:#6c6'>"
+                "<strong>ASR worker is running in this process.</strong> "
+                f"Queued jobs are picked up within ~5 seconds.{pending_note}</p>"
             )
 
         def render_movie_row(it):

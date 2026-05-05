@@ -100,10 +100,50 @@ def test_api_asr_status_endpoint(tmp_path):
     client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
     r = client.get("/api/admin/asr-status")
     assert r.status_code == 200
-    # 'available' is False on the test box (we don't install nemo for tests)
-    # — if you DO install [asr] it'd be True. Just verify the field exists.
-    assert "available" in r.json()
-    assert isinstance(r.json()["available"], bool)
+    body = r.json()
+    # 'available' is False on the test box (we don't install nemo for tests).
+    # 'worker_in_process' is False because we haven't started one. 'queued'
+    # is 0 because no jobs were enqueued.
+    assert body == {"available": False, "worker_in_process": False, "queued": 0}
+
+
+def test_admin_subtitles_warns_when_worker_not_running(tmp_path, monkeypatch):
+    """If [asr] is installed but no worker is running in this process, the
+    page should call that out specifically — that was the missing signal
+    the user hit."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, _ = _admin_client_with_movie(tmp_path)
+    # Pretend [asr] is installed; mark_worker_started has not been called.
+    monkeypatch.setattr(asr, "is_available", lambda: True)
+    asr._worker_in_process = False
+    r = client.get("/admin/subtitles")
+    assert r.status_code == 200
+    assert "no worker is running" in r.text
+    assert "--with-asr-worker" in r.text
+
+
+def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, _ = _admin_client_with_movie(tmp_path)
+    monkeypatch.setattr(asr, "is_available", lambda: True)
+    asr._worker_in_process = True
+    try:
+        r = client.get("/admin/subtitles")
+        assert r.status_code == 200
+        assert "ASR worker is running in this process" in r.text
+    finally:
+        asr._worker_in_process = False  # reset for other tests
+
+
+def test_admin_subtitles_shows_pending_count(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, db_path, media_id = _admin_client_with_movie(tmp_path)
+    client.post(f"/admin/asr/{media_id}", follow_redirects=False)
+    r = client.get("/admin/subtitles")
+    assert "1 ASR job(s) waiting" in r.text
 
 
 # --- ASR resolver: writes SRT in the right place per scenario ---------

@@ -32,6 +32,21 @@ def is_available() -> bool:
         return False
 
 
+# Process-local flag set when an ASR worker thread is spawned in this server
+# process. The /admin/subtitles page checks this so users see whether queued
+# jobs will actually be picked up here, vs sitting forever in the queue.
+_worker_in_process = False
+
+
+def mark_worker_started() -> None:
+    global _worker_in_process
+    _worker_in_process = True
+
+
+def is_worker_in_process() -> bool:
+    return _worker_in_process
+
+
 @dataclass
 class SrtCue:
     index: int
