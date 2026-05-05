@@ -290,6 +290,28 @@ the job finishes — captions appear automatically.
 GPU strongly recommended; on CPU one short film can take several minutes.
 The first run also downloads the Parakeet model (~1 GB).
 
+#### CUDA driver too old?
+
+If you see an error like `The NVIDIA driver on your system is too old`
+in `/admin/jobs`, the PyTorch shipped with `[asr]` was built for a newer
+CUDA than your driver supports. You have two options:
+
+1. **Run ASR on CPU** (easiest, just slower):
+
+   ```bash
+   ./start.sh --asr-cpu          # equivalent to: CUTTLEFISH_ASR_CPU=1 ./start.sh
+   ```
+
+   The `CUTTLEFISH_ASR_CPU=1` env var hides GPUs from torch before any
+   import, so NeMo loads cleanly on CPU. Cuttlefish also probes CUDA at
+   model-load time and falls back automatically when it detects this
+   exact failure mode, but the env var makes it explicit and skips the
+   probe.
+
+2. **Install a PyTorch matching your driver.** See
+   <https://pytorch.org/get-started/locally/> for the right `--index-url`
+   for your CUDA version, then `uv pip install` it inside `.venv/`.
+
 ## Optional: TLS via Let's Encrypt
 
 Use a [TOML config file](docs/configuration.md). Minimal example:

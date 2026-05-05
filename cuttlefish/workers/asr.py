@@ -142,6 +142,31 @@ def extract_audio_for_asr(video_path: Path, wav_path: Path, ffmpeg: str = "ffmpe
     subprocess.run(cmd, check=True)
 
 
+def _force_cpu_if_cuda_broken() -> None:
+    """If the GPU appears available but actually crashes when used, monkey-
+    patch torch.cuda.is_available so NeMo falls back to CPU instead of
+    raising an unhelpful 'driver too old' or 'abstract class' error.
+
+    This is a best-effort runtime safety net; for clean CPU-only operation
+    set CUTTLEFISH_ASR_CPU=1 in the environment (handled in __main__.py).
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        _ = torch.zeros(1, device="cuda")
+    except Exception as e:
+        log.warning(
+            "CUDA appears unusable (%s) — falling back to CPU for ASR. "
+            "Set CUTTLEFISH_ASR_CPU=1 to silence this and skip the probe.",
+            e,
+        )
+        torch.cuda.is_available = lambda: False  # type: ignore[assignment]
+
+
 def transcribe_to_srt(
     video_path: Path,
     output_srt: Path,
@@ -158,13 +183,26 @@ def transcribe_to_srt(
             "ASR dependencies (torch + nemo_toolkit) not installed. "
             "Install with: uv sync --extra asr"
         )
+    _force_cpu_if_cuda_broken()
     import nemo.collections.asr as nemo_asr  # type: ignore
 
     with tempfile.TemporaryDirectory() as td:
         wav = Path(td) / "audio.wav"
         extract_audio_for_asr(video_path, wav, ffmpeg=ffmpeg)
         log.info("loading Parakeet model %s", model_id)
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
+        try:
+            model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
+        except RuntimeError as e:
+            msg = str(e)
+            if "NVIDIA driver" in msg or "CUDA driver" in msg:
+                raise RuntimeError(
+                    "Could not load the Parakeet model on this GPU because "
+                    "the installed PyTorch was built for a newer CUDA "
+                    "driver than this machine has. Restart with "
+                    "`CUTTLEFISH_ASR_CPU=1 ./start.sh --asr` (or pass "
+                    "`--asr-cpu` to start.sh) to run on CPU instead."
+                ) from e
+            raise
         log.info("transcribing %s", video_path)
         # NeMo's transcribe API varies by version. We try the newer kw, then
         # fall back to the older positional form.

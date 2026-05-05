@@ -5,6 +5,7 @@
 #   ./start.sh                  # base install, ASR worker on if [asr] is installed
 #   ./start.sh --asr            # also install [asr] (~2 GB) before starting
 #   ./start.sh --no-asr-worker  # skip the ASR worker even if available
+#   ./start.sh --asr-cpu        # run ASR on CPU only (use when CUDA driver mismatches)
 #   ./start.sh --host 0.0.0.0 --port 9000   # forward flags to cuttlefish serve
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -35,6 +36,9 @@ for arg in "$@"; do
             ;;
         --no-asr-worker)
             SKIP_ASR_WORKER=true
+            ;;
+        --asr-cpu)
+            export CUTTLEFISH_ASR_CPU=1
             ;;
         *)
             PASSTHROUGH+=("$arg")

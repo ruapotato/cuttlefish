@@ -1,3 +1,10 @@
+import os
+# When CUTTLEFISH_ASR_CPU=1, hide GPUs from torch BEFORE any other module
+# imports torch. Lets users with a mismatched CUDA driver/runtime fall back
+# to CPU-only ASR without rebuilding PyTorch.
+if os.environ.get("CUTTLEFISH_ASR_CPU"):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import argparse
 import sys
 from pathlib import Path
