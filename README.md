@@ -54,20 +54,28 @@ sudo zypper install ffmpeg       # openSUSE
 ```bash
 git clone https://github.com/ruapotato/cuttlefish.git
 cd cuttlefish
-uv sync
 ```
-
-`uv sync` reads `.python-version` and `pyproject.toml`, downloads the right
-Python interpreter (3.11) if you don't have it, creates `.venv/`, and
-installs every dependency. You don't need to activate anything.
 
 ### 3. Start the server
 
 ```bash
-uv run cuttlefish serve --with-worker
+./start.sh                # base install + encode worker
+./start.sh --asr          # ALSO install [asr] (~2 GB) and run the subtitle worker
 ```
 
-The first time you run this, cuttlefish creates an admin account for you
+`start.sh` is a thin wrapper that runs `uv sync`, auto-detects whether
+the optional ASR dependencies are present, and launches `cuttlefish serve`
+with every worker your install supports. Pass any extra flag (`--port`,
+`--host`, `--db`) and it gets forwarded to the server.
+
+If you'd rather drive uv yourself, the equivalent two-step is:
+
+```bash
+uv sync                                          # or: uv sync --extra asr
+uv run cuttlefish serve --with-worker            # add --with-asr-worker if [asr] is installed
+```
+
+The first time you run either, cuttlefish creates an admin account for you
 and prints the password right at the top of the output:
 
 ```
@@ -87,10 +95,10 @@ started embedded encode worker (thread=encode-worker)
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-Copy that password somewhere safe — you'll change it in step 5. `--with-worker`
-runs the ffmpeg encode worker in a background thread inside the same
+Copy that password somewhere safe — you'll change it in step 5. The
+embedded encode worker runs in a background thread inside the same
 process, so a single command is enough. Want it on your LAN? Add
-`--host 0.0.0.0`.
+`--host 0.0.0.0` (or run `./start.sh --host 0.0.0.0`).
 
 ### 4. Log in and add a library
 
@@ -250,7 +258,15 @@ generate captions from the video's audio using
 [NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2).
 
 ```bash
-uv sync --extra asr                          # ~2 GB of torch + nemo
+./start.sh --asr
+```
+
+That installs the `[asr]` extras (~2 GB of torch + nemo, one-time) and
+launches the server with both the encode worker and the ASR worker
+running in-process. Equivalent manual steps:
+
+```bash
+uv sync --extra asr
 uv run cuttlefish serve --with-worker --with-asr-worker
 ```
 
@@ -261,15 +277,18 @@ Once the server is running, **two web flows** kick off ASR jobs:
   **Generate subtitles via ASR** button. One click queues the job.
 - **Bulk from `/admin/subtitles`**: a table of every movie + episode
   with a "subtitle present?" column and a Generate button on each row.
-  The page also shows whether the ASR worker dependencies are
-  installed; if not, you can still queue jobs and they'll run when a
-  worker comes online.
+  The page also shows whether the ASR worker is actually running:
+    - 🟥 deps not installed → install command shown
+    - 🟥 installed but no worker in this process → restart flag shown
+    - 🟩 worker running → "queued jobs picked up within ~5 seconds"
+  …and the live count of ASR jobs currently waiting in the queue.
 
 The worker writes the resulting SRT next to the source file (or in the
 clean folder if the item has been encoded). Refresh the watch page when
 the job finishes — captions appear automatically.
 
 GPU strongly recommended; on CPU one short film can take several minutes.
+The first run also downloads the Parakeet model (~1 GB).
 
 ## Optional: TLS via Let's Encrypt
 
@@ -385,6 +404,7 @@ CI runs the same on every push and PR — see `.github/workflows/test.yml`.
 The codebase is organized as:
 
 ```
+start.sh                wrapper: uv sync → detect [asr] → exec cuttlefish serve
 cuttlefish/
   __main__.py           CLI entry point + bootstrap-admin banner
   db.py                 SQLite schema + idempotent migrations
