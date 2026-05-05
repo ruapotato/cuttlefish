@@ -74,7 +74,10 @@ def test_html_index(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Cuttlefish" in r.text
-    assert "movies" in r.text
+    # The merged home shows media organized by kind, not library names.
+    # The fixture has movie-kind media, so the Movies section should appear.
+    assert "Movies" in r.text
+    assert "alpha" in r.text and "beta" in r.text
 
 
 def test_html_library(client):

@@ -151,10 +151,13 @@ def test_poster_endpoint_serves_image(tmp_path):
     assert r.content == img_bytes
 
 
-def test_poster_endpoint_404_when_missing(tmp_path):
+def test_poster_endpoint_404_when_video_unreadable(tmp_path):
+    """Without a sidecar AND with a video that ffmpeg can't read (empty file),
+    the /poster endpoint falls back to thumbnail generation, fails, and 404s.
+    """
     root = tmp_path / "movies"
     root.mkdir()
-    (root / "Movie.mp4").write_bytes(b"")
+    (root / "Movie.mp4").write_bytes(b"")  # empty — generation will fail
     db_path = tmp_path / "t.db"
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:

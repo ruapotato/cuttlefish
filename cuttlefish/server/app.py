@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, We
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from cuttlefish import auth, cruft as cruft_mod, db, subtitles as subs_mod
+from cuttlefish import auth, cruft as cruft_mod, db, subtitles as subs_mod, thumbnails as thumbs_mod
 from cuttlefish.clients.opensubtitles import OpenSubtitles
 from cuttlefish.clients.tmdb import TMDb
 from cuttlefish.server.cast import CastBus
@@ -212,25 +212,54 @@ def create_app(
     def poster_for_media(media_id: int):
         from fastapi.responses import FileResponse
         row = _conn().execute(
-            "SELECT m.poster_path, e.poster_path AS encoded_poster "
+            "SELECT m.kind, m.source_path, m.poster_path, "
+            "       e.poster_path AS encoded_poster, e.video_path AS encoded_video "
             "FROM media m LEFT JOIN encoded_files e ON e.media_id = m.id "
             "WHERE m.id = ?",
             (media_id,),
         ).fetchone()
         if not row:
             raise HTTPException(404, "media not found")
+        # Real posters first
         for candidate in (row["encoded_poster"], row["poster_path"]):
             if candidate:
                 p = Path(candidate)
                 if p.is_file():
                     return FileResponse(p)
-        raise HTTPException(404, "no poster available")
+        # Fall back to a frame extracted from the video. Audiobooks have
+        # no video frame to extract so we 404 and the page shows a placeholder.
+        if row["kind"] == "audiobook":
+            raise HTTPException(404, "no poster available")
+        # For TV shows, the show row's source_path is a directory of seasons.
+        # Use the first episode's video as the show thumbnail source.
+        if row["kind"] == "tv_show":
+            ep = _conn().execute(
+                "SELECT source_path, ee.video_path AS encoded_video "
+                "FROM tv_episodes "
+                "LEFT JOIN encoded_episodes ee ON ee.episode_id = tv_episodes.id "
+                "WHERE show_id = ? "
+                "ORDER BY season, episode, id LIMIT 1",
+                (media_id,),
+            ).fetchone()
+            if ep is None:
+                raise HTTPException(404, "no poster available")
+            video = _resolve_video_for_thumbnail(ep, kind="episode")
+        else:
+            video = _resolve_video_for_thumbnail(row, kind="movie")
+        if video is None:
+            raise HTTPException(404, "no poster available")
+        out = thumbs_mod.media_thumb_path(media_id)
+        gen = thumbs_mod.get_or_generate(video, out)
+        if gen is None:
+            raise HTTPException(404, "no poster available")
+        return FileResponse(gen)
 
     @app.get("/poster/episode/{episode_id}")
     def poster_for_episode(episode_id: int):
         from fastapi.responses import FileResponse
         row = _conn().execute(
-            "SELECT e.poster_path, ee.poster_path AS encoded_poster "
+            "SELECT e.poster_path, e.source_path, "
+            "       ee.poster_path AS encoded_poster, ee.video_path AS encoded_video "
             "FROM tv_episodes e LEFT JOIN encoded_episodes ee ON ee.episode_id = e.id "
             "WHERE e.id = ?",
             (episode_id,),
@@ -242,7 +271,15 @@ def create_app(
                 p = Path(candidate)
                 if p.is_file():
                     return FileResponse(p)
-        raise HTTPException(404, "no poster available")
+        # Fallback: frame from the encoded video, or the source video
+        video = _resolve_video_for_thumbnail(row, kind="episode")
+        if video is None:
+            raise HTTPException(404, "no poster available")
+        out = thumbs_mod.episode_thumb_path(episode_id)
+        gen = thumbs_mod.get_or_generate(video, out)
+        if gen is None:
+            raise HTTPException(404, "no poster available")
+        return FileResponse(gen)
 
     # --- Auth API --------------------------------------------------------
 
@@ -1316,10 +1353,10 @@ library can contain all kinds of media, mixed.</p>
     @app.get("/", response_class=HTMLResponse)
     def page_index(request: Request):
         user = _current_user(request)
-        rows = _conn().execute(
-            "SELECT id, name, root_path FROM libraries ORDER BY id"
-        ).fetchall()
-        if not rows:
+        conn = _conn()
+        # Empty-state: no libraries registered at all
+        lib_count = conn.execute("SELECT COUNT(*) AS c FROM libraries").fetchone()["c"]
+        if lib_count == 0:
             if user and user["is_admin"]:
                 body = (
                     "<p class='empty'>No libraries yet. Open "
@@ -1337,13 +1374,57 @@ library can contain all kinds of media, mixed.</p>
                     "<p class='empty'>No libraries yet. "
                     "<a href='/login'>Log in</a> as admin to add one.</p>"
                 )
-        else:
-            items = "".join(
-                f"<li><a href='/library/{r['id']}'>{html.escape(r['name'])}</a></li>"
-                for r in rows
+            return _page("Cuttlefish", body, user=user)
+
+        # All media merged across every library, grouped by kind
+        rows = conn.execute(
+            "SELECT id, kind, title_guess, poster_path FROM media "
+            "ORDER BY kind, title_guess"
+        ).fetchall()
+        sections = {"movie": [], "tv_show": [], "audiobook": []}
+        for r in rows:
+            sections.setdefault(r["kind"], []).append(r)
+
+        def render_card(item):
+            url = _watch_url(item["kind"], item["id"])
+            return (
+                f"<li class='card'><a href='{url}'>"
+                f"<div class='poster-wrap'>"
+                f"<div class='no-poster'></div>"
+                f"<img src='/poster/{item['id']}' alt='' loading='lazy' "
+                f"onerror=\"this.style.display='none'\">"
+                f"</div>"
+                f"<span class='card-title'>{html.escape(item['title_guess'])}</span>"
+                f"</a></li>"
             )
-            body = f"<ul class='libraries'>{items}</ul>"
-        return _page("Libraries", body, user=user)
+
+        section_order = [
+            ("movie", "Movies"),
+            ("tv_show", "TV Shows"),
+            ("audiobook", "Audiobooks"),
+        ]
+        parts = []
+        for kind, label in section_order:
+            items = sections.get(kind) or []
+            if not items:
+                continue
+            cards = "".join(render_card(it) for it in items)
+            parts.append(
+                f"<section class='media-section'>"
+                f"<h2>{label} <span class='kind'>({len(items)})</span></h2>"
+                f"<ul class='cards'>{cards}</ul>"
+                f"</section>"
+            )
+
+        if not parts:
+            body = (
+                "<p class='empty'>No media yet. "
+                "Open <a href='/admin/libraries'>Admin → Libraries</a> and "
+                "click <strong>Scan</strong>.</p>"
+            )
+        else:
+            body = "".join(parts)
+        return _page("Cuttlefish", body, user=user)
 
     @app.get("/library/{library_id}", response_class=HTMLResponse)
     def page_library(library_id: int, request: Request):
@@ -1364,9 +1445,13 @@ library can contain all kinds of media, mixed.</p>
         else:
             items = "".join(
                 f"<li class='card'><a href='{_watch_url(m['kind'], m['id'])}'>"
-                + (f"<img src='/poster/{m['id']}' alt=''>" if m['poster_path'] else "<div class='no-poster'></div>")
-                + f"<span class='card-title'>{html.escape(m['title_guess'])}</span>"
-                + f"<span class='card-kind'>{_kind_label(m['kind'])}</span>"
+                f"<div class='poster-wrap'>"
+                f"<div class='no-poster'></div>"
+                f"<img src='/poster/{m['id']}' alt='' loading='lazy' "
+                f"onerror=\"this.style.display='none'\">"
+                f"</div>"
+                f"<span class='card-title'>{html.escape(m['title_guess'])}</span>"
+                f"<span class='card-kind'>{_kind_label(m['kind'])}</span>"
                 "</a></li>"
                 for m in media
             )
@@ -2079,13 +2164,23 @@ ul.cards { list-style: none; padding: 0; display: grid;
             grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 1rem; }
 ul.cards li.card a { display: block; }
-ul.cards li.card img, ul.cards li.card .no-poster {
-    width: 100%; aspect-ratio: 2 / 3; object-fit: cover;
-    background: #222; border-radius: 4px; display: block;
-}
+ul.cards li.card .poster-wrap { position: relative; aspect-ratio: 2 / 3;
+                                  border-radius: 4px; overflow: hidden;
+                                  background: #222; }
+ul.cards li.card .poster-wrap .no-poster { position: absolute; inset: 0;
+                                            background: #222;
+                                            background-image: linear-gradient(135deg,
+                                              #1a1a1a 25%, #222 25%, #222 50%,
+                                              #1a1a1a 50%, #1a1a1a 75%, #222 75%); }
+ul.cards li.card .poster-wrap img { position: absolute; inset: 0;
+                                     width: 100%; height: 100%;
+                                     object-fit: cover; }
 ul.cards li.card .card-title { display: block; font-size: .9em; padding: .4rem 0 0;
                                 color: #eee; line-height: 1.2; }
 ul.cards li.card .card-kind { display: block; font-size: .75em; color: #888; }
+section.media-section { margin-bottom: 2rem; }
+section.media-section h2 { color: #eee; margin-bottom: .75rem; }
+section.media-section h2 .kind { color: #888; font-size: .7em; font-weight: normal; }
 img.show-poster { max-width: 200px; max-height: 300px; float: right;
                    margin: 0 0 1rem 1rem; border-radius: 4px; }
 form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
@@ -2150,6 +2245,29 @@ def _human_size(n: Optional[int]) -> str:
 
 def _kind_label(kind: str) -> str:
     return {"movie": "Movie", "tv_show": "TV Show", "audiobook": "Audiobook"}.get(kind, kind)
+
+
+def _resolve_video_for_thumbnail(row, kind: str) -> Optional[Path]:
+    """Pick a video file we can ffmpeg a frame from for the thumbnail.
+
+    For movies + episodes: prefer the encoded version if present; fall back
+    to the source. For TV shows the row's source_path is the show directory
+    — caller handles that via the show poster route, not this helper.
+    """
+    encoded = row["encoded_video"]
+    if encoded and Path(encoded).is_file():
+        return Path(encoded)
+    src = Path(row["source_path"])
+    if src.is_file():
+        return src
+    if src.is_dir():
+        # Movie folder layout: pick the first video inside
+        for child in sorted(src.iterdir()):
+            if child.is_file() and child.suffix.lower() in {
+                ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".wmv"
+            }:
+                return child
+    return None
 
 
 def _watch_url(kind: str, media_id: int) -> str:

@@ -22,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from cuttlefish import thumbnails as _thumbs
 from cuttlefish.probe import get_duration
 from cuttlefish.titles import title_from_filename
 
@@ -221,13 +222,18 @@ def _add_movie(conn: sqlite3.Connection, library_id: int, source: Path,
     title = title_from_filename(source.name)
     poster = _find_poster_for(source)
     if source.is_file():
-        duration = get_duration(source)
+        video_path: Path | None = source
     else:
         videos, _, _ = _direct_children(source)
-        duration = get_duration(videos[0]) if videos else None
-    _upsert_media(conn, library_id, "movie", source, title,
-                  poster_path=poster, duration_seconds=duration)
+        video_path = videos[0] if videos else None
+    duration = get_duration(video_path) if video_path else None
+    media_id = _upsert_media(conn, library_id, "movie", source, title,
+                             poster_path=poster, duration_seconds=duration)
     result.movies_added += 1
+    # Pre-generate a frame thumbnail when no sidecar poster exists, so the
+    # home page poster grid loads without on-demand ffmpeg pauses.
+    if poster is None and video_path is not None:
+        _thumbs.get_or_generate(video_path, _thumbs.media_thumb_path(media_id))
 
 
 def _add_audiobook(conn: sqlite3.Connection, library_id: int, folder: Path,
@@ -264,6 +270,7 @@ def _add_show(conn: sqlite3.Connection, library_id: int, show_dir: Path,
     show_id = _upsert_media(conn, library_id, "tv_show", show_dir, title,
                             poster_path=poster)
     result.shows_added += 1
+    first_episode_video: Path | None = None
     # Discover seasons
     season_entries: list[tuple[int, Path]] = []
     fallback_index = 1
@@ -305,7 +312,19 @@ def _add_show(conn: sqlite3.Connection, library_id: int, show_dir: Path,
                         ep_dur,
                     ),
                 )
+            ep_id = conn.execute(
+                "SELECT id FROM tv_episodes WHERE show_id = ? AND source_path = ?",
+                (show_id, str(ep_file)),
+            ).fetchone()["id"]
             result.episodes_added += 1
+            # Pre-generate per-episode thumbnail when no sidecar exists
+            if ep_poster is None:
+                _thumbs.get_or_generate(ep_file, _thumbs.episode_thumb_path(ep_id))
+            if first_episode_video is None:
+                first_episode_video = ep_file
+    # Show-level thumbnail comes from the first episode's video
+    if poster is None and first_episode_video is not None:
+        _thumbs.get_or_generate(first_episode_video, _thumbs.media_thumb_path(show_id))
 
 
 def _walk_audiobook_grouping(

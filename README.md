@@ -130,10 +130,13 @@ members. Each gets their own per-user resume positions and casting state.
 
 ### 6. Watch something
 
-Go to `/` — you'll see your libraries. Click one → click any title → it
-plays in the browser. Captions appear automatically if a `.srt` lives
-next to the video. Posters show up automatically if a sibling `.jpg`
-(or `poster.jpg` in a folder) exists.
+Go to `/` — you'll see all of your media merged into one page,
+organized into **Movies / TV Shows / Audiobooks** sections. Every
+library you've added contributes to those sections. Click any title and
+it plays in the browser. Captions appear automatically if a `.srt`
+lives next to the video. Posters show up automatically if a sibling
+`.jpg` (or `poster.jpg` in a folder) exists; for any video that has
+neither, cuttlefish extracts a frame ~5 minutes in and uses that.
 
 That's it. **Everything else below is optional**, and everything from
 this point on is doable from the web UI — you don't need to drop back to
