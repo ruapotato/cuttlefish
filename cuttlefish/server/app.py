@@ -2305,31 +2305,56 @@ def _watch_url(kind: str, media_id: int) -> str:
 
 
 def _player_progress_js(progress_url: str) -> str:
-    """JS that resumes, saves position, and starts playback automatically.
+    """JS that resumes, saves position, autoplays, and enters fullscreen on
+    the user's first interaction.
 
-    Tries to play with sound; on failure (browsers block autoplay-with-sound
-    until they trust the site) falls back to muted autoplay so you at least
-    see the picture moving — user clicks the unmute button on the controls.
+    Browsers block requestFullscreen() without a recent user gesture, and a
+    click that navigates to a new page no longer counts once the new page
+    loads. So we autoplay (muted if necessary) on canplay, and the FIRST
+    click or keypress on the watch page enters fullscreen. Double-click on
+    the video element toggles fullscreen back off.
     """
     return (
         "<script>(function(){"
         "var el=document.getElementById('player');"
         f"var url='{progress_url}';"
+        # --- Resume position
         "var loaded=false;"
         "fetch(url).then(function(r){return r.ok?r.json():null;}).then(function(p){"
         "  if(!p||!p.position_seconds)return;"
         "  el.addEventListener('loadedmetadata',function(){if(loaded)return;loaded=true;el.currentTime=p.position_seconds;});"
         "});"
+        # --- Autoplay (muted fallback if browser rejects sound)
         "el.addEventListener('canplay',function once(){"
         "  el.removeEventListener('canplay',once);"
         "  el.play().catch(function(){el.muted=true;el.play().catch(function(){});});"
         "});"
+        # --- Save progress every ~5 seconds of playback
         "var last=0;"
         "el.addEventListener('timeupdate',function(){"
         "  var t=el.currentTime;if(Math.abs(t-last)<5)return;last=t;"
         "  fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},"
         "    body:JSON.stringify({position_seconds:t,duration_seconds:el.duration||null})});"
-        "});})();</script>"
+        "});"
+        # --- Fullscreen: try on first user gesture, and on double-click toggle
+        "function fs(){if(document.fullscreenElement)return;"
+        "  var f=el.requestFullscreen||el.webkitRequestFullscreen||el.mozRequestFullScreen||el.msRequestFullscreen;"
+        "  if(f){try{var p=f.call(el);if(p&&p.catch)p.catch(function(){});}catch(e){}}"
+        "  if(el.muted){el.muted=false;}"
+        "}"
+        "function firstGesture(){"
+        "  fs();"
+        "  document.removeEventListener('click',firstGesture,true);"
+        "  document.removeEventListener('keydown',firstGesture,true);"
+        "  document.removeEventListener('touchstart',firstGesture,true);"
+        "}"
+        "document.addEventListener('click',firstGesture,true);"
+        "document.addEventListener('keydown',firstGesture,true);"
+        "document.addEventListener('touchstart',firstGesture,true);"
+        "el.addEventListener('dblclick',function(){"
+        "  if(document.fullscreenElement){document.exitFullscreen();}else{fs();}"
+        "});"
+        "})();</script>"
     )
 
 
