@@ -1,124 +1,371 @@
 # Cuttlefish
 
-A self-hosted media server — movies, TV, audiobooks — served from your own machine through a clean web UI you can open on a phone, a laptop, or your smart TV's built-in browser.
+A self-hosted media server for movies, TV, and audiobooks. Streams to a phone,
+laptop, or your smart TV's built-in browser. Pre-encodes your library to a
+single compatible format instead of transcoding on the fly.
 
-> **Status: work in progress.** Cuttlefish is in active design / early scaffolding. Almost nothing in the planned-features list below is implemented yet. This README documents what cuttlefish *will be* so contributors and the author have a single source of truth while it's being built.
+> **Status: works end-to-end.** Scan, encode, watch with captions, resume,
+> cast between devices. Tested with 218 unit + integration tests against
+> real ffmpeg. See "What's not implemented yet" at the bottom for the
+> short list of gaps.
 
-## Why another media server
+## What you get
 
-Jellyfin and Emby are great, but cuttlefish makes a different bet:
+- **One-shot pre-encoding** to H.264/AAC/MP4 1080p — every modern device
+  plays directly, no on-the-fly transcoding.
+- **Scanner** that auto-detects movies vs TV shows vs audiobooks from
+  folder structure, picks up sidecar posters and subtitles, probes
+  duration with ffprobe.
+- **Web UI** that runs on smart TV browsers (no JS framework, server-rendered
+  HTML), with poster grid, search, "Continue Watching", browser-native
+  captions via WebVTT.
+- **User accounts** with per-user resume across movies, TV episodes, and
+  audiobook chapters.
+- **Multi-device casting** — log into the same account on the TV and your
+  phone, then control the TV from your phone (play / pause / seek).
+- **Admin web UI** for everything: add libraries, scan, queue encodes,
+  delete originals after re-encode, manage users, clean up cruft files.
+- **TLS** via Let's Encrypt + DNS-01 (any [certbot DNS plugin](https://eff-certbot.readthedocs.io/en/stable/using.html#dns-plugins)).
 
-- **Pre-encode, don't transcode.** Jellyfin/Emby transcode on the fly so they can adapt to whatever the client supports. Cuttlefish instead does a one-shot batch re-encode of your library to a format every modern device can play directly (H.264 + AAC in MP4, capped at 1080p). Smaller library, simpler server, no CPU spikes when grandma starts a movie.
-- **Light enough for a smart TV's built-in browser.** No JS framework. Server-rendered HTML where it makes sense, vanilla JS where it doesn't. The same UI works on a 2018 Samsung TV browser, a phone, and a desktop.
-- **Light, simple, clean** is the rule. We do less than Jellyfin on purpose.
+## Try it (5 minutes)
 
-## Planned features
-
-All of the below are *planned*, not built.
-
-- **Library scanner** that auto-detects movies vs. TV shows vs. audiobooks from folder structure (single file = movie; subdirs of files = TV show; folder of audio = audiobook; folder of folders = audiobook series/grouping).
-- **Pre-encoding pipeline** (ffmpeg). One-shot batch: downscale 4K → 1080p, normalize to H.264/AAC/MP4, never re-encode at stream time. Originals are preserved on disk until manually deleted via the admin UI — cuttlefish never auto-deletes media.
-- **Cleanup** of cruft files (`downloadedfrom.txt`, etc.). Manual confirm in the admin UI; no silent deletion.
-- **Metadata + posters** via [TMDb](https://www.themoviedb.org/). Renames and posters land in a clean `Title/Title.{mp4,srt,jpg}` layout per item.
-- **Subtitles** via a fallback chain: existing sidecar `.srt` → [OpenSubtitles](https://www.opensubtitles.com/) API → [NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) ASR (each step opt-in).
-- **TLS via Let's Encrypt** with the ACME DNS-01 challenge. Pluggable DNS provider (Cloudflare is the documented default; Route53, DigitalOcean, etc. work via certbot plugins). Handles 90-day renewal automatically.
-- **User accounts** with per-user resume position across all media types.
-- **Multi-device session control** — log into the same account on TV and phone; use the phone as a remote for the TV.
-
-## Stack
-
-| Layer | Choice | Why |
-|---|---|---|
-| Server | Python 3.11 + [FastAPI](https://fastapi.tiangolo.com/) | Async streaming with HTTP range requests built in. Healthy ecosystem for ffmpeg/ML integration. |
-| Database | SQLite | Single file, zero infra. Also serves as the job queue for workers — no Redis/Celery. |
-| Encoding worker | Python + ffmpeg | Pulls jobs from SQLite, shells out to ffmpeg. |
-| ASR worker | Python + [NeMo](https://github.com/NVIDIA/NeMo) + Parakeet-TDT | Optional. Generates SRTs for content with no available subtitles. Heavy ML deps live only in this worker. |
-| Frontend | HTML + CSS + vanilla JS | No build step, no framework. Must run on smart TV browsers. |
-| TLS | [certbot](https://certbot.eff.org/) DNS-01 | Pluggable DNS provider; Let's Encrypt 90-day certs. |
-| Env / packaging | [uv](https://docs.astral.sh/uv/) | One-line install, manages Python interpreter + venv + lockfile in a single tool. |
-
-## Setup
-
-### Prerequisites
-
-- **ffmpeg** on your `$PATH`. (`apt install ffmpeg`, `brew install ffmpeg`, etc.)
-- A **domain you control** with API access at its DNS host. (Required for TLS. Cuttlefish supports any DNS provider with a [certbot DNS plugin](https://eff-certbot.readthedocs.io/en/stable/using.html#dns-plugins).)
-- For the optional ASR worker only: an **NVIDIA GPU** with CUDA. CPU works but is slow.
-
-### Install
-
-Cuttlefish uses [uv](https://docs.astral.sh/uv/) for everything Python — interpreter, venv, dependencies. Install it once:
+### 1. Install [uv](https://docs.astral.sh/uv/) — one line
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then clone and sync:
+(uv manages the Python interpreter, the venv, and dependencies in one tool.
+Already installed? Skip this.)
+
+You also need **ffmpeg** on your `$PATH`:
 
 ```bash
-git clone <this-repo-url> cuttlefish
+sudo apt install ffmpeg          # Debian/Ubuntu
+brew install ffmpeg              # macOS
+sudo zypper install ffmpeg       # openSUSE
+```
+
+### 2. Get the code
+
+```bash
+git clone https://github.com/ruapotato/cuttlefish.git
 cd cuttlefish
 uv sync
 ```
 
-`uv sync` reads `.python-version` and `pyproject.toml`, downloads the right Python interpreter if you don't have it, creates a `.venv/` in the repo, and installs every dependency. No virtualenv activation required.
+`uv sync` reads `.python-version` and `pyproject.toml`, downloads the right
+Python interpreter (3.11) if you don't have it, creates `.venv/`, and
+installs every dependency. You don't need to activate anything.
 
-### Run
-
-Always run cuttlefish through `uv run`. This guarantees the project's pinned Python and dependencies are used — no system-Python or wrong-venv surprises.
+### 3. Start the server
 
 ```bash
-uv run cuttlefish --help
+uv run cuttlefish serve --with-worker
 ```
 
-Once a server entry point exists, the typical command will be:
+You'll see:
 
-```bash
-uv run cuttlefish serve --config /path/to/config.toml
+```
+started embedded encode worker (thread=encode-worker)
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-> **Don't `pip install` cuttlefish or activate the venv manually.** The whole point of `uv run` is that the right environment is selected automatically every invocation. If you find yourself reaching for `source .venv/bin/activate`, that's a sign something's wrong with the setup, not a workaround.
+`--with-worker` runs the ffmpeg encode worker in a background thread inside
+the same process, so a single command is enough. Want it on your LAN? Add
+`--host 0.0.0.0`.
 
-### ASR worker (optional)
+### 4. Register the first user (in your browser)
 
-The ASR worker pulls in `torch` and `nemo_toolkit` (~2 GB on disk). Skip it unless you actually want subtitle generation for content with no available SRTs.
+Open http://localhost:8000/register
+
+Fill in a username and password (≥ 6 chars). The first user automatically
+becomes the **admin**. Future users are admin-only to create.
+
+### 5. Add a library
+
+Click **Admin → Libraries** in the header (or open
+http://localhost:8000/admin/libraries directly).
+
+Fill in the form:
+
+| field | example |
+|---|---|
+| Name | `Movies` |
+| Kind | `Movies` |
+| Root path | `/data/Movies` (or wherever your files actually live) |
+
+Click **Add**. Then click **Scan all libraries**. The page reloads and
+your library is populated.
+
+### 6. Watch something
+
+Go to http://localhost:8000/ — you'll see your libraries. Click one →
+click any title → it plays in the browser. Captions appear automatically
+if a `.srt` lives next to the video. Posters show up automatically if a
+sibling `.jpg` (or `poster.jpg` in a folder) exists.
+
+That's it. Everything else below is optional.
+
+---
+
+## CLI alternative (if you prefer)
+
+Everything the web UI does is available from the command line. Same
+result, different ergonomics:
 
 ```bash
-uv sync --extra asr
-uv run cuttlefish-asr-worker
-```
-
-## Configuration
-
-External API credentials are read from environment variables:
-
-| Variable | Used for | Required |
-|---|---|---|
-| `TMDB_API_KEY` | Movie/show metadata + posters | Optional (lookups no-op without it) |
-| `OPENSUBTITLES_API_KEY` | Subtitle search | Optional |
-| `OPENSUBTITLES_USERNAME` / `OPENSUBTITLES_PASSWORD` | Subtitle download | Required if you want OpenSubtitles to actually download files |
-
-The DB defaults to `$XDG_DATA_HOME/cuttlefish/cuttlefish.db` (typically
-`~/.local/share/cuttlefish/cuttlefish.db`). Override with `--db PATH`.
-
-## CLI
-
-```bash
+# Same Python env, no activation needed:
 uv run cuttlefish init-db
-uv run cuttlefish add-library open_movies /path/to/movies --kind movies
-uv run cuttlefish scan
-uv run cuttlefish list-media
-uv run cuttlefish serve --host 0.0.0.0 --port 8000
-uv run cuttlefish encode-worker        # background re-encode loop
-uv run cuttlefish encode-now <id>      # one-shot synchronous encode
-uv run cuttlefish asr-worker           # background subtitle generator (needs --extra asr)
+uv run cuttlefish add-library Movies /data/Movies --kind movies
+uv run cuttlefish add-library TV /data/TV-Shows --kind tv
+uv run cuttlefish add-library Audiobooks /data/Audiobooks --kind audiobooks
+
+uv run cuttlefish list-libraries        # what's registered
+uv run cuttlefish scan                  # all libraries
+uv run cuttlefish scan Movies           # one library by name
+uv run cuttlefish list-media            # everything found
+uv run cuttlefish list-media --library Movies
 ```
 
-## Deferred designs
+To run the server later: `uv run cuttlefish serve --with-worker`.
 
-- [TLS](docs/tls.md) — Let's Encrypt + DNS-01 via certbot, pluggable DNS provider.
-- [Casting / multi-device control](docs/casting.md) — websocket-based session control.
+## Re-encoding (the headline feature)
+
+Cuttlefish's bet is "encode once, stream forever". Instead of transcoding
+on the fly when grandma starts a movie, you re-encode each title once into
+a clean Title/Title.mp4 layout that every modern device plays directly.
+
+### From the web admin
+
+1. **Admin → Encode media** lists everything not yet encoded.
+2. Click **Enqueue encode** next to any item — it goes onto the worker's
+   queue and the embedded worker picks it up.
+3. **Admin → Jobs** shows the queue with status colors (queued / running
+   / done / failed).
+4. When done, **Admin → Cleanup originals** lists the originals that now
+   have an encoded version on disk. Each row has its own **Delete original**
+   button that asks for browser confirmation. Originals are *never*
+   automatically deleted — this is always a manual step.
+
+### Or one-shot from the CLI
+
+```bash
+uv run cuttlefish list-media           # find the id of the title
+uv run cuttlefish encode-now 5         # encode it synchronously
+```
+
+Output for a 49 MB Blender short looks like:
+
+```
+encoded /data/Movies/Coffee Run/Coffee Run.mp4 (53506105 bytes)
+```
+
+The original `Coffee Run-PVGeM40dABA.mkv` stays on disk until you delete
+it via the admin UI.
+
+## Optional: real metadata + subtitles + ASR
+
+Cuttlefish works great without any of these — it'll use whatever sidecar
+files (`.srt`, `.jpg`) are next to your media. Plug these in to fetch
+the rest from the internet.
+
+### TMDb posters and titles
+
+Get a free API key at <https://www.themoviedb.org/settings/api>, then:
+
+```bash
+export TMDB_API_KEY=your_key_here
+uv run cuttlefish serve --with-worker
+```
+
+In the admin, hit `POST /api/admin/metadata/{media_id}` for any title that
+has been encoded — it looks the title up on TMDb and downloads the poster
+into the clean folder.
+
+### OpenSubtitles
+
+Get a free API key at <https://www.opensubtitles.com/en/consumers>, plus
+a regular OpenSubtitles account for downloads:
+
+```bash
+export OPENSUBTITLES_API_KEY=...
+export OPENSUBTITLES_USERNAME=...
+export OPENSUBTITLES_PASSWORD=...
+```
+
+Then `POST /api/admin/subtitle/{media_id}` searches and downloads.
+
+### ASR for content with no available subtitles
+
+The fallback when neither a sidecar SRT nor OpenSubtitles has anything:
+generate captions from the video's audio using
+[NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2).
+
+```bash
+uv sync --extra asr                          # ~2 GB of torch + nemo
+uv run cuttlefish serve --with-worker --with-asr-worker
+```
+
+In the admin, `POST /api/admin/asr/{media_id}` enqueues an ASR job. The
+worker writes the resulting SRT into the clean folder so the watch page
+picks it up automatically.
+
+GPU strongly recommended.
+
+## Optional: TLS via Let's Encrypt
+
+Use a [TOML config file](docs/configuration.md). Minimal example:
+
+```toml
+# /etc/cuttlefish/cuttlefish.toml
+db = "/var/lib/cuttlefish/cuttlefish.db"
+
+[server]
+host = "0.0.0.0"
+port = 443
+with_worker = true
+
+[tls]
+enabled = true
+domain = "media.example.com"
+email = "you@example.com"
+dns_provider = "cloudflare"     # any certbot-dns-* plugin
+dns_credentials_file = "/etc/cuttlefish/cloudflare.ini"
+cert_dir = "/etc/letsencrypt/live/media.example.com"
+
+[[library]]
+name = "Movies"
+kind = "movies"
+root = "/data/Movies"
+
+[[library]]
+name = "TV"
+kind = "tv"
+root = "/data/TV-Shows"
+```
+
+Run with:
+
+```bash
+uv run cuttlefish serve --config /etc/cuttlefish/cuttlefish.toml
+```
+
+On startup cuttlefish provisions/renews the cert via certbot, configures
+uvicorn with the cert + key, and runs a daily renewal-check thread. Full
+details + DNS provider table in [docs/tls.md](docs/tls.md).
+
+## Casting (control the TV from your phone)
+
+1. Log in on the TV browser, open something to watch.
+2. Log in as the same user on your phone, open `/cast`.
+3. The TV is listed as a target. Tap **Pause / Play / -10s / +30s**.
+
+Limitations of the MVP: you can't *start* playback on the TV from the
+phone yet, only control whatever is already playing there. The schema
+and websocket bus are in place; richer launch flow is a follow-on.
+See [docs/casting.md](docs/casting.md) for design notes.
+
+## What you can hit
+
+### HTML pages
+
+| URL | What |
+|---|---|
+| `/` | Library index, poster grid |
+| `/library/{id}` | Items in one library |
+| `/show/{id}` | Episodes grouped by season |
+| `/book/{id}` | Audiobook chapter playlist with auto-advance |
+| `/watch/{id}` | Movie player (auto-redirects for shows/books) |
+| `/watch/episode/{id}` | TV episode player |
+| `/search?q=...` | Search across titles |
+| `/continue-watching` | What you've started, with mark-watched + reset |
+| `/cast` | Multi-device controller |
+| `/login`, `/register` | Auth |
+| `/admin`, `/admin/{libraries,users,encode,jobs,cleanup,cruft}` | Admin |
+
+### JSON API (a selection — full list at `/api/docs`)
+
+```
+GET    /api/libraries
+GET    /api/media[?library=&kind=]
+GET    /api/media/{id}
+GET    /stream/{id}                # range-aware
+GET    /stream/episode/{id}
+GET    /stream/track/{id}
+GET    /subtitle/{id}              # served as WebVTT
+GET    /poster/{id}
+GET    /api/search?q=
+GET    /api/continue-watching
+PUT    /api/progress/{id}          # also episode/{id} and book/{id}
+POST   /api/auth/{register,login,logout}
+GET    /api/me
+POST   /api/admin/libraries
+POST   /api/admin/scan[/{id}]
+POST   /api/admin/encode/{id}
+GET    /api/admin/cleanup-candidates
+DELETE /api/admin/originals/{id}
+GET    /health
+```
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Server | Python 3.11 + [FastAPI](https://fastapi.tiangolo.com/) |
+| Database | SQLite (also serves as the job queue) |
+| Encoder | ffmpeg (H.264 High@L4.0, CRF 22, AAC 128k, MP4 +faststart) |
+| ASR (optional) | NVIDIA Parakeet via [NeMo](https://github.com/NVIDIA/NeMo) |
+| Frontend | Plain HTML + CSS + vanilla JS, no build step |
+| TLS | Let's Encrypt via certbot, DNS-01 challenge |
+| Env / packaging | [uv](https://docs.astral.sh/uv/) |
+
+## Development
+
+```bash
+uv sync --extra dev          # adds pytest + ruff
+uv run pytest -q             # 218 tests, ~25 seconds
+uv run ruff check .
+```
+
+CI runs the same on every push and PR — see `.github/workflows/test.yml`.
+
+The codebase is organized as:
+
+```
+cuttlefish/
+  __main__.py           CLI entry point
+  db.py                 SQLite schema + idempotent migrations
+  scanner.py            filesystem walker
+  titles.py             filename → display title cleanup
+  probe.py              ffprobe wrapper
+  cruft.py              non-media file detection
+  subtitles.py          SRT → WebVTT
+  config.py             TOML loader
+  tls.py                certbot wrapper
+  auth.py               scrypt + sessions
+  clients/              tmdb, opensubtitles
+  workers/              encoder, asr
+  server/
+    app.py              FastAPI routes
+    streaming.py        HTTP range request handler
+    cast.py             websocket pub/sub bus
+tests/                  one test file per module
+docs/                   tls, casting, configuration
+```
+
+## What's not implemented yet
+
+Real but small follow-ons:
+
+- Auto-fetching TMDb metadata during scan (right now it's an admin click).
+- TV episode encode buttons on the show page.
+- "Cast → start playing X on the TV" — currently casting can only control
+  playback already in progress on the target.
+- Dockerfile / systemd unit (works fine without; just standard Python +
+  uv + ffmpeg).
 
 ## License
 
-[AGPL-3.0](LICENSE). If you run a modified cuttlefish as a network service, your modifications must be available to your users.
+[AGPL-3.0](LICENSE). If you run a modified cuttlefish as a network service,
+your modifications must be available to your users.

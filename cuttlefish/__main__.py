@@ -144,6 +144,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # Always ensure the schema exists — makes a fresh install work end-to-end
+    # without having to remember `init-db` first.
+    db.init_schema(db.connect(args.db))
+
     if args.with_worker:
         t = threading.Thread(
             target=encoder.run_worker,
