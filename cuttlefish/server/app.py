@@ -534,6 +534,19 @@ def create_app(
         job_id = encoder.enqueue_encode(conn, media_id)
         return {"ok": True, "job_id": job_id}
 
+    @app.get("/api/admin/jobs/{job_id}")
+    def api_admin_get_job(job_id: int, request: Request):
+        _require_admin(request)
+        row = _conn().execute(
+            "SELECT id, kind, media_id, episode_id, status, error, "
+            "       created_at, started_at, finished_at "
+            "FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "job not found")
+        return dict(row)
+
     @app.get("/api/admin/jobs")
     def api_admin_list_jobs(request: Request, status: Optional[str] = None):
         _require_admin(request)
@@ -1657,16 +1670,18 @@ library can contain all kinds of media, mixed.</p>
             else ""
         )
         admin_actions = ""
+        admin_js = ""
         if user and user["is_admin"] and not has_subtitle:
             admin_actions = (
                 "<div class='admin-actions'>"
-                f"<form method='post' action='/admin/asr/{media_id}'>"
-                "<button type='submit'>Generate subtitles via ASR</button>"
-                "</form>"
-                "<span class='hint'>Queues a Parakeet job. The worker writes "
-                "an SRT next to the source — refresh this page when it's done.</span>"
+                "<button id='gen-subs' type='button'>Generate subtitles via ASR</button>"
+                "<span id='gen-subs-status' class='hint'>"
+                "Queues a Parakeet job. We'll show progress here and reload "
+                "automatically when subtitles are ready."
+                "</span>"
                 "</div>"
             )
+            admin_js = _generate_subs_js(f"/api/admin/asr/{media_id}")
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1680,6 +1695,7 @@ library can contain all kinds of media, mixed.</p>
             f"{admin_actions}"
             "</div>"
             + _player_progress_js(f"/api/progress/{media_id}")
+            + admin_js
         )
         return _page(title, body, user=user, body_class="watch")
 
@@ -1744,16 +1760,18 @@ library can contain all kinds of media, mixed.</p>
             else ""
         )
         admin_actions = ""
+        admin_js = ""
         if user and user["is_admin"] and not has_subtitle:
             admin_actions = (
                 "<div class='admin-actions'>"
-                f"<form method='post' action='/admin/asr/episode/{episode_id}'>"
-                "<button type='submit'>Generate subtitles via ASR</button>"
-                "</form>"
-                "<span class='hint'>Queues a Parakeet job. The worker writes "
-                "an SRT next to the source — refresh this page when it's done.</span>"
+                "<button id='gen-subs' type='button'>Generate subtitles via ASR</button>"
+                "<span id='gen-subs-status' class='hint'>"
+                "Queues a Parakeet job. We'll show progress here and reload "
+                "automatically when subtitles are ready."
+                "</span>"
                 "</div>"
             )
+            admin_js = _generate_subs_js(f"/api/admin/asr/episode/{episode_id}")
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1768,6 +1786,7 @@ library can contain all kinds of media, mixed.</p>
             f"{admin_actions}"
             "</div>"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
+            + admin_js
         )
         return _page(title, body, user=user, body_class="watch")
 
@@ -2512,6 +2531,64 @@ def _watch_url(kind: str, media_id: int) -> str:
     if kind == "audiobook":
         return f"/book/{media_id}"
     return f"/watch/{media_id}"
+
+
+def _generate_subs_js(post_url: str) -> str:
+    """Inline ASR-progress JS for the watch page admin button.
+
+    Wires the 'Generate subtitles via ASR' button to POST the job, then
+    polls /api/admin/jobs/{id} every few seconds and updates a status
+    line in place. When the job's done, reloads the page so the
+    server-rendered <track> shows up and captions become available.
+    """
+    return (
+        "<script>(function(){"
+        "var btn=document.getElementById('gen-subs');"
+        "var status=document.getElementById('gen-subs-status');"
+        "if(!btn||!status) return;"
+        "btn.addEventListener('click',function(){"
+        "  btn.disabled=true;"
+        "  status.textContent='Queuing job...';"
+        f"  fetch('{post_url}',{{method:'POST'}}).then(function(r){{"
+        "    if(!r.ok){throw new Error('HTTP '+r.status);}"
+        "    return r.json();"
+        "  }}).then(function(j){"
+        "    status.textContent='Queued (job #'+j.job_id+'). Waiting for worker...';"
+        "    poll(j.job_id);"
+        "  }).catch(function(e){"
+        "    status.textContent='Queue failed: '+e.message;"
+        "    btn.disabled=false;"
+        "  });"
+        "});"
+        "var lastStatus='';"
+        "function poll(jid){"
+        "  fetch('/api/admin/jobs/'+jid).then(function(r){"
+        "    if(!r.ok)throw new Error('HTTP '+r.status);"
+        "    return r.json();"
+        "  }).then(function(job){"
+        "    if(job.status!==lastStatus){"
+        "      lastStatus=job.status;"
+        "      if(job.status==='queued')status.textContent='Queued — waiting for the ASR worker to pick it up...';"
+        "      else if(job.status==='running')status.textContent='Transcribing — seconds on GPU, several minutes on CPU.';"
+        "    }"
+        "    if(job.status==='done'){"
+        "      status.textContent='Subtitles ready. Reloading...';"
+        "      setTimeout(function(){location.reload();},800);"
+        "      return;"
+        "    }"
+        "    if(job.status==='failed'){"
+        "      status.textContent='ASR job failed: '+(job.error||'unknown error');"
+        "      btn.disabled=false;"
+        "      return;"
+        "    }"
+        "    setTimeout(function(){poll(jid);},3000);"
+        "  }).catch(function(e){"
+        "    status.textContent='Polling error: '+e.message+'; will retry';"
+        "    setTimeout(function(){poll(jid);},5000);"
+        "  });"
+        "}"
+        "})();</script>"
+    )
 
 
 def _player_progress_js(progress_url: str) -> str:

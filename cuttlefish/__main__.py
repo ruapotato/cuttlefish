@@ -176,6 +176,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from cuttlefish import auth as _auth
     conn = db.connect(args.db)
     db.init_schema(conn)
+    # If the previous server died mid-job, the job is stuck in 'running'
+    # and no worker will ever pick it back up (the queue lives on
+    # status='queued'). Reset stale running jobs so they get retried.
+    with conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status = 'queued', started_at = NULL "
+            "WHERE status = 'running'"
+        )
+    if cur.rowcount and cur.rowcount > 0:
+        print(
+            f"Reset {cur.rowcount} stale 'running' job(s) → 'queued' "
+            "(orphaned by a previous worker death).",
+            file=sys.stderr,
+        )
     creds = _auth.bootstrap_admin_if_empty(conn)
     if creds:
         _print_bootstrap_banner(args.host, args.port, creds[0], creds[1])

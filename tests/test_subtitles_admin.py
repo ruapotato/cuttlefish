@@ -250,7 +250,10 @@ def test_watch_page_shows_generate_button_for_admin_when_no_subtitle(tmp_path):
     r = client.get(f"/watch/{media_id}")
     assert r.status_code == 200
     assert "Generate subtitles via ASR" in r.text
-    assert f"action='/admin/asr/{media_id}'" in r.text
+    # Watch page now uses a JS-driven button + polling, not a form redirect.
+    assert "id='gen-subs'" in r.text
+    assert f"/api/admin/asr/{media_id}" in r.text  # POST URL embedded in the inline JS
+    assert "/api/admin/jobs/" in r.text  # polling URL embedded in the inline JS
 
 
 def test_watch_page_hides_generate_button_when_subtitle_present(tmp_path):
@@ -287,3 +290,39 @@ def test_watch_page_no_generate_button_for_anonymous(tmp_path):
     r = client.get(f"/watch/{media_id}")
     assert r.status_code == 200
     assert "Generate subtitles via ASR" not in r.text
+
+
+# --- Single-job API endpoint ----------------------------------------
+
+
+def test_api_get_single_job(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, db_path, media_id = _admin_client_with_movie(tmp_path)
+    r = client.post(f"/api/admin/asr/{media_id}")
+    job_id = r.json()["job_id"]
+
+    r = client.get(f"/api/admin/jobs/{job_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == job_id
+    assert body["kind"] == "asr"
+    assert body["media_id"] == media_id
+    assert body["status"] == "queued"
+    assert body["error"] is None
+
+
+def test_api_get_single_job_404(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, _ = _admin_client_with_movie(tmp_path)
+    assert client.get("/api/admin/jobs/9999").status_code == 404
+
+
+def test_api_get_single_job_requires_admin(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, media_id = _admin_client_with_movie(tmp_path)
+    client.post(f"/api/admin/asr/{media_id}")
+    client.post("/api/auth/logout")
+    assert client.get("/api/admin/jobs/1").status_code == 401
