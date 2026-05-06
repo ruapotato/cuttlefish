@@ -86,8 +86,6 @@ swap_torch_for_cuda() {
         cuda_ver="$ASR_CUDA_OVERRIDE"
         echo ">>> Using --asr-cuda override: $cuda_ver"
     elif command -v nvidia-smi >/dev/null 2>&1; then
-        # Pipefail + set -e make piped grep brittle when a line doesn't match.
-        # Capture the full output once and use bash regex against the string.
         nvsmi_out=$(nvidia-smi 2>/dev/null || true)
         if [[ "$nvsmi_out" =~ CUDA\ Version:[[:space:]]+([0-9]+\.[0-9]+) ]]; then
             cuda_ver="${BASH_REMATCH[1]}"
@@ -111,14 +109,50 @@ swap_torch_for_cuda() {
             return 0
             ;;
     esac
-    echo ">>> Installing torch wheel for CUDA $cuda_ver ($tag) — this swaps the"
-    echo "    torch installed by 'uv sync' for one matching your driver."
+
+    # Skip the swap if torch is already on the right wheel.
+    local cur_torch=""
+    cur_torch=$(uv run --no-sync python -c "import torch; print(torch.__version__)" 2>/dev/null || true)
+    if [[ "$cur_torch" == *"+${tag}" ]]; then
+        echo ">>> torch is already built for $tag ($cur_torch); no swap needed."
+        return 0
+    fi
+
+    echo ">>> Swapping torch (currently ${cur_torch:-default}) to a $tag wheel..."
+    # The default torch from PyPI brings in the latest nvidia-cuda-* packages
+    # (CUDA 13 at time of writing). Those don't get auto-removed when we
+    # swap torch, and they conflict with what cu124 torch wants. Wipe them
+    # explicitly so the cu124 install ends up with a coherent CUDA-12 stack.
+    uv pip uninstall \
+        nvidia-cublas nvidia-cuda-cupti nvidia-cuda-nvrtc nvidia-cuda-runtime \
+        nvidia-cufft nvidia-cufile nvidia-curand nvidia-cusolver \
+        nvidia-cusparse nvidia-nvjitlink nvidia-nvtx triton \
+        nvidia-cublas-cu13 nvidia-cuda-cupti-cu13 nvidia-cuda-nvrtc-cu13 \
+        nvidia-cudnn-cu13 nvidia-cufft-cu13 nvidia-curand-cu13 \
+        nvidia-cusolver-cu13 nvidia-cusparse-cu13 nvidia-cusparselt-cu13 \
+        nvidia-nccl-cu13 nvidia-nvjitlink-cu13 nvidia-nvshmem-cu13 \
+        nvidia-nvtx-cu13 \
+        >/dev/null 2>&1 || true
+
+    # Install ONLY from PyTorch's wheel index — no --extra-index-url, which
+    # was letting uv pick a newer torch off PyPI built for CUDA 13.
+    echo ">>> Installing torch from https://download.pytorch.org/whl/$tag ..."
     if uv pip install --reinstall-package torch torch \
-            --index-url "https://download.pytorch.org/whl/$tag" \
-            --extra-index-url "https://pypi.org/simple"; then
-        echo ">>> torch installed for $tag — ASR should run on GPU."
+            --index-url "https://download.pytorch.org/whl/$tag"; then
+        local new_torch
+        new_torch=$(uv run --no-sync python -c "import torch; print(torch.__version__)" 2>/dev/null || true)
+        echo ">>> torch installed: $new_torch"
+        if [[ "$new_torch" == *"+${tag}" ]]; then
+            echo ">>> ASR should run on GPU."
+        else
+            echo ">>> WARNING: torch reinstalled but not tagged $tag." >&2
+            echo "    Likely the $tag index has no compatible wheel." >&2
+            echo "    Falling back to CPU mode." >&2
+            export CUTTLEFISH_ASR_CPU=1
+        fi
     else
-        echo ">>> WARNING: couldn't swap torch wheel; ASR will fall back to CPU." >&2
+        echo ">>> WARNING: torch swap failed; falling back to CPU mode." >&2
+        export CUTTLEFISH_ASR_CPU=1
     fi
     return 0
 }
@@ -130,7 +164,7 @@ fi
 # --- Decide which worker flags to pass ---------------------------------
 
 WORKER_FLAGS=("--with-worker")
-if ! $SKIP_ASR_WORKER && uv run python -c "import nemo.collections.asr" >/dev/null 2>&1; then
+if ! $SKIP_ASR_WORKER && uv run --no-sync python -c "import nemo.collections.asr" >/dev/null 2>&1; then
     WORKER_FLAGS+=("--with-asr-worker")
     echo ">>> ASR dependencies detected — starting with --with-asr-worker."
 else
@@ -142,5 +176,7 @@ fi
 
 # --- Go ----------------------------------------------------------------
 
-echo ">>> uv run cuttlefish serve ${WORKER_FLAGS[*]} ${PASSTHROUGH[*]}"
-exec uv run cuttlefish serve "${WORKER_FLAGS[@]}" "${PASSTHROUGH[@]}"
+# --no-sync: 'uv run' would otherwise reconcile the venv against pyproject
+# + uv.lock, which would undo the manual torch wheel swap above.
+echo ">>> uv run --no-sync cuttlefish serve ${WORKER_FLAGS[*]} ${PASSTHROUGH[*]}"
+exec uv run --no-sync cuttlefish serve "${WORKER_FLAGS[@]}" "${PASSTHROUGH[@]}"
