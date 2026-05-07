@@ -140,6 +140,120 @@ def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
         asr._worker_in_process = False  # reset for other tests
 
 
+def test_jobs_by_ids_endpoint_returns_status_counts(tmp_path):
+    """The bulk progress poller scopes to specific job IDs via this endpoint
+    so it doesn't get skewed by unrelated ASR jobs queued elsewhere."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+
+    root = tmp_path / "media"; root.mkdir()
+    _make_video(root / "A.mp4")
+    _make_video(root / "B.mp4")
+    _make_video(root / "C.mp4")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    media_ids = [r["id"] for r in conn.execute("SELECT id FROM media").fetchall()]
+    job_ids = []
+    with conn:
+        for mid in media_ids:
+            c = conn.execute("INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (mid,))
+            job_ids.append(c.lastrowid)
+        # Also queue an unrelated ASR job — should NOT affect the scoped count.
+        conn.execute("INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (media_ids[0],))
+        # Mark one of OUR jobs as done, one as failed.
+        conn.execute("UPDATE jobs SET status = 'done' WHERE id = ?", (job_ids[0],))
+        conn.execute("UPDATE jobs SET status = 'failed', error = 'boom' WHERE id = ?", (job_ids[1],))
+        # The unrelated job stays 'queued'.
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+
+    ids_str = ",".join(str(i) for i in job_ids)
+    r = client.get(f"/api/admin/jobs/by-ids?ids={ids_str}")
+    assert r.status_code == 200
+    body = r.json()
+    # Scoped counts: 1 done, 1 failed, 1 queued, 0 running. The unrelated
+    # 'queued' job is NOT counted because its ID isn't in the list.
+    assert body == {"queued": 1, "running": 0, "done": 1, "failed": 1}
+
+
+def test_jobs_by_ids_empty_input(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+    db_path = tmp_path / "t.db"
+    db.init_schema(db.connect(db_path))
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    # Empty / missing ids → all-zero, not 400
+    r = client.get("/api/admin/jobs/by-ids?ids=")
+    assert r.status_code == 200
+    assert r.json() == {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    r2 = client.get("/api/admin/jobs/by-ids")
+    assert r2.status_code == 200
+
+
+def test_jobs_by_ids_rejects_non_integer(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+    db_path = tmp_path / "t.db"
+    db.init_schema(db.connect(db_path))
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    r = client.get("/api/admin/jobs/by-ids?ids=abc,def")
+    assert r.status_code == 400
+
+
+def test_bulk_asr_returns_job_ids(tmp_path):
+    """The bulk endpoint returns the IDs it inserted so the UI can scope
+    its progress polling to exactly those jobs."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+
+    root = tmp_path / "media"; root.mkdir()
+    _make_video(root / "A.mp4")
+    _make_video(root / "B.mp4")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+        lib_id = cur.lastrowid
+    scanner.scan_library(conn, lib_id, root)
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    r = client.post(f"/api/admin/asr/library/{lib_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["queued"] == 2
+    assert "job_ids" in body
+    assert len(body["job_ids"]) == 2
+    # Confirm those IDs actually exist as ASR jobs.
+    rows = conn.execute(
+        f"SELECT id, kind, status FROM jobs WHERE id IN ({','.join('?' * len(body['job_ids']))})",
+        body["job_ids"],
+    ).fetchall()
+    assert all(r["kind"] == "asr" and r["status"] == "queued" for r in rows)
+
+
 def test_bulk_asr_for_library_queues_everything_without_existing_asr(tmp_path):
     """Queue ASR for every movie + every episode in a library that doesn't
     already have a <stem>.asr.srt sitting next to it."""
@@ -241,8 +355,10 @@ def test_admin_subtitles_page_has_bulk_section(tmp_path):
     assert "class='bulk-asr-btn'" in r.text
     assert "class='bulk-asr-status'" in r.text
     assert "data-lib-id=" in r.text
-    # Polling URL referenced from the inline JS
-    assert "/api/admin/asr-status" in r.text
+    # Polling URL referenced from the inline JS — scoped to this submit's
+    # job IDs (not the global ASR queue) so unrelated ASR jobs don't skew
+    # the progress display.
+    assert "/api/admin/jobs/by-ids" in r.text
 
 
 def test_admin_subtitles_shows_pending_count(tmp_path):

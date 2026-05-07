@@ -575,6 +575,43 @@ def create_app(
         job_id = encoder.enqueue_encode(conn, media_id)
         return {"ok": True, "job_id": job_id}
 
+    @app.get("/api/admin/jobs/by-ids")
+    def api_admin_jobs_by_ids(request: Request, ids: str = ""):
+        """Return per-status counts for the specified job IDs. Used by the
+        bulk-ASR progress poller so it tracks just the jobs THIS click
+        created, not the global ASR queue.
+
+        ids: comma-separated integer job IDs.
+        Returns: {queued, running, done, failed}
+
+        IMPORTANT: this route must be declared BEFORE
+        `/api/admin/jobs/{job_id}` — otherwise FastAPI matches `by-ids`
+        as a path parameter and returns 422.
+        """
+        _require_admin(request)
+        if not ids.strip():
+            return {"queued": 0, "running": 0, "done": 0, "failed": 0}
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(400, "ids must be comma-separated integers")
+        if not id_list:
+            return {"queued": 0, "running": 0, "done": 0, "failed": 0}
+        # SQLite has a parameter-count limit (default 999). Chunk the lookup
+        # so a giant bulk submission still works.
+        counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+        for start in range(0, len(id_list), 800):
+            chunk = id_list[start:start + 800]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = _conn().execute(
+                f"SELECT status, COUNT(*) AS c FROM jobs "
+                f"WHERE id IN ({placeholders}) GROUP BY status",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                counts[r["status"]] = counts.get(r["status"], 0) + r["c"]
+        return counts
+
     @app.get("/api/admin/jobs/{job_id}")
     def api_admin_get_job(job_id: int, request: Request):
         _require_admin(request)
@@ -773,16 +810,17 @@ def create_app(
             )
         return {"ok": True, "job_id": cur.lastrowid}
 
-    def _bulk_enqueue_asr_for_library(conn, library_id: int) -> int:
+    def _bulk_enqueue_asr_for_library(conn, library_id: int) -> list[int]:
         """Queue an ASR job for every movie + episode in the library that
-        doesn't already have an ASR variant on disk. Returns the count
-        enqueued. Idempotent: re-runs after partial completion only enqueue
-        what's still missing."""
+        doesn't already have an ASR variant on disk. Returns the list of
+        newly-created job IDs so the caller / UI can track *just these*
+        jobs to completion (vs the global ASR queue count, which can
+        include unrelated work)."""
         if conn.execute(
             "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
         ).fetchone() is None:
             raise HTTPException(404, "library not found")
-        n = 0
+        job_ids: list[int] = []
         movies = conn.execute(
             "SELECT id FROM media WHERE library_id = ? AND kind = 'movie'",
             (library_id,),
@@ -792,10 +830,10 @@ def create_app(
             if "asr" in variants:
                 continue
             with conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (m["id"],)
                 )
-            n += 1
+            job_ids.append(cur.lastrowid)
         eps = conn.execute(
             "SELECT e.id FROM tv_episodes e "
             "JOIN media m ON m.id = e.show_id "
@@ -807,24 +845,25 @@ def create_app(
             if "asr" in variants:
                 continue
             with conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO jobs (kind, episode_id) VALUES ('asr', ?)", (e["id"],)
                 )
-            n += 1
-        return n
+            job_ids.append(cur.lastrowid)
+        return job_ids
 
     @app.post("/api/admin/asr/library/{library_id}")
     def api_admin_enqueue_asr_library(library_id: int, request: Request):
         _require_admin(request)
-        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
-        return {"ok": True, "queued": n}
+        ids = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        return {"ok": True, "queued": len(ids), "job_ids": ids}
 
     @app.post("/admin/asr/library/{library_id}")
     def page_admin_enqueue_asr_library(library_id: int, request: Request):
         _require_admin(request)
-        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        ids = _bulk_enqueue_asr_for_library(_conn(), library_id)
         return RedirectResponse(
-            f"/admin/subtitles?queued={n}&lib={library_id}", status_code=303,
+            f"/admin/subtitles?queued={len(ids)}&lib={library_id}",
+            status_code=303,
         )
 
     @app.get("/api/admin/asr-status")
@@ -3127,6 +3166,13 @@ _BULK_ASR_JS = r"""
     span.innerHTML = spinner + '<span class="asr-text">' + text + '</span>';
   }
 
+  function reenable(libId) {
+    var btn = document.querySelector(
+      'button.bulk-asr-btn[data-lib-id="' + libId + '"]'
+    );
+    if (btn) btn.disabled = false;
+  }
+
   buttons.forEach(function(btn) {
     btn.addEventListener('click', function() {
       var libId = btn.dataset.libId;
@@ -3146,49 +3192,62 @@ _BULK_ASR_JS = r"""
             setStatus(status, 'done',
               'Nothing to queue — every item already has an ASR variant.',
               false);
-            btn.disabled = false;
+            reenable(libId);
             return;
           }
           setStatus(status, 'running',
             'Queued ' + j.queued + ' ASR job(s). Worker is processing…',
             true);
-          pollGlobal(status, j.queued);
+          // Track *exactly* the IDs we just enqueued so other ASR work
+          // (per-item Generate clicks, previous bulk runs) doesn't skew
+          // the percentage.
+          pollScoped(status, libId, j.job_ids || [], j.queued);
         })
         .catch(function(e) {
           setStatus(status, 'failed', 'Queue failed: ' + e.message, false);
-          btn.disabled = false;
+          reenable(libId);
         });
     });
   });
 
-  function pollGlobal(status, initial) {
-    fetch('/api/admin/asr-status')
+  function pollScoped(status, libId, jobIds, total) {
+    if (!jobIds.length) {
+      setStatus(status, 'done', '✓ All ASR jobs done.', false);
+      reenable(libId);
+      return;
+    }
+    var url = '/api/admin/jobs/by-ids?ids=' + encodeURIComponent(jobIds.join(','));
+    fetch(url)
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(s) {
         if (!s) {
-          setTimeout(function() { pollGlobal(status, initial); }, 5000);
+          setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 5000);
           return;
         }
-        var pending = (s.queued || 0);
-        if (pending === 0) {
-          setStatus(status, 'done', '✓ All ASR jobs done.', false);
-          // Allow re-running for any items added since.
-          var lid = status.dataset.libId;
-          var btn = document.querySelector(
-            'button.bulk-asr-btn[data-lib-id="' + lid + '"]'
-          );
-          if (btn) btn.disabled = false;
+        var done = (s.done || 0) + (s.failed || 0);
+        var remaining = (s.queued || 0) + (s.running || 0);
+        if (remaining === 0) {
+          if (s.failed > 0) {
+            setStatus(status, 'failed',
+              '✗ ' + s.done + ' of ' + total + ' done, ' + s.failed + ' failed.',
+              false);
+          } else {
+            setStatus(status, 'done',
+              '✓ All ' + total + ' ASR jobs done.', false);
+          }
+          reenable(libId);
           return;
         }
-        var done = Math.max(0, initial - pending);
-        var pct = initial ? Math.round(100 * done / initial) : 0;
+        var pct = total ? Math.round(100 * done / total) : 0;
+        var details = (s.running ? ' (' + s.running + ' running)' : '');
         setStatus(status, 'running',
-          done + ' / ' + initial + ' done (' + pct + '%) — ' + pending + ' remaining',
+          done + ' / ' + total + ' done (' + pct + '%) — '
+            + remaining + ' remaining' + details,
           true);
-        setTimeout(function() { pollGlobal(status, initial); }, 3000);
+        setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 3000);
       })
       .catch(function() {
-        setTimeout(function() { pollGlobal(status, initial); }, 5000);
+        setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 5000);
       });
   }
 })();</script>
