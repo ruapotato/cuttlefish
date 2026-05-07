@@ -193,6 +193,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         _print_bootstrap_banner(args.host, args.port, creds[0], creds[1])
 
     if args.with_worker:
+        encoder.mark_worker_started()
         t = threading.Thread(
             target=encoder.run_worker,
             kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},

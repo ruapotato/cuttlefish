@@ -282,7 +282,7 @@ def test_admin_subtitles_page_renders_running_indicator_for_refresh(tmp_path):
     assert r.status_code == 200
     # The rendered worker div should be in 'running' state (not the JS-only
     # idle text that lives inside the script tag).
-    assert "<div id='asr-worker' class='asr-worker running'>" in r.text
+    assert "<div class='jobs-worker running'>" in r.text
     assert "Worker is transcribing:" in r.text
 
 
@@ -292,7 +292,7 @@ def test_admin_subtitles_page_renders_idle_indicator_when_no_jobs(tmp_path):
     client, _, _ = _admin_client_with_movie(tmp_path)
     r = client.get("/admin/subtitles")
     assert r.status_code == 200
-    assert "<div id='asr-worker' class='asr-worker idle'>" in r.text
+    assert "<div class='jobs-worker idle'>" in r.text
 
 
 def test_bulk_asr_for_library_queues_everything_without_existing_asr(tmp_path):
@@ -393,20 +393,20 @@ def test_admin_subtitles_page_has_bulk_section(tmp_path):
     assert "Bulk: whole library" in r.text
     assert "Generate ASR for everything in this library" in r.text
     # JS-driven button + status span (not a form-redirect)
-    assert "class='bulk-asr-btn'" in r.text
-    assert "class='bulk-asr-status'" in r.text
+    assert "class='bulk-jobs-btn'" in r.text
+    assert "class='bulk-jobs-status'" in r.text
     assert "data-lib-id=" in r.text
     # The page is its own dashboard: it polls a single per-library status
     # endpoint and re-renders the cells. Refresh = same view.
     assert "/api/admin/asr/library-status" in r.text
     # Per-library count cells are server-rendered so a refresh shows the
     # live state immediately without waiting for the first JS poll.
-    assert "asr-queued" in r.text
-    assert "asr-running" in r.text
-    assert "asr-done" in r.text
-    assert "asr-failed" in r.text
+    assert "jobs-queued" in r.text
+    assert "jobs-running" in r.text
+    assert "jobs-done" in r.text
+    assert "jobs-failed" in r.text
     # Worker-activity indicator is always present (idle or running variant).
-    assert "id='asr-worker'" in r.text or 'id="asr-worker"' in r.text
+    assert "jobs-worker" in r.text
 
 
 def test_admin_subtitles_shows_pending_count(tmp_path):

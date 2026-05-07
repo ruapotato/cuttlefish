@@ -27,6 +27,21 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# Process-local flag set when an encode-worker thread is spawned in this
+# server process. Mirrors the ASR worker indicator so /admin/encode can
+# tell the user whether queued jobs will actually be picked up here.
+_worker_in_process = False
+
+
+def mark_worker_started() -> None:
+    global _worker_in_process
+    _worker_in_process = True
+
+
+def is_worker_in_process() -> bool:
+    return _worker_in_process
+
+
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".wmv")
 POSTER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 SUBTITLE_EXTS = (".srt", ".vtt", ".ass")

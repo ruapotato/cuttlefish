@@ -840,21 +840,32 @@ def create_app(
             "queued": pending,
         }
 
-    def _compute_asr_library_status(conn) -> dict:
-        """Per-library ASR job rollup + 'what is the worker on right now'.
-
-        Single source of truth for both the server-rendered initial page
-        load and the JSON polling endpoint, so a refresh during a bulk run
-        shows the exact same display the JS would have driven to.
+    def _compute_jobs_library_status(conn, kind: str) -> dict:
+        """Per-library job rollup (queued/running/done/failed) plus 'what
+        is the worker on right now' for jobs of the given `kind`. Used by
+        both /admin/subtitles (kind='asr') and /admin/encode (kind='encode')
+        as a single source of truth: server-renders the initial page state
+        AND backs the polling endpoint, so refreshing during a bulk run
+        always shows live state.
         """
-        from cuttlefish.workers import asr as _asr
+        if kind == "asr":
+            from cuttlefish.workers import asr as _w
+            worker_running = _w.is_worker_in_process()
+            worker_available = _w.is_available()
+        elif kind == "encode":
+            from cuttlefish.workers import encoder as _w
+            worker_running = _w.is_worker_in_process()
+            # Encoding only needs ffmpeg, which start.sh asserts up-front;
+            # there's no extra ML dep that can be missing the way NeMo can.
+            worker_available = True
+        else:
+            raise ValueError(f"unknown job kind: {kind}")
 
-        # Per-library counts. Jobs link to a library either through media
-        # directly OR through a tv_episode whose show is itself a media row.
         libs = conn.execute(
             "SELECT id, name FROM libraries ORDER BY id"
         ).fetchall()
-        # Pre-seed every library so libraries with zero ASR jobs still appear.
+        # Pre-seed every library so libraries with zero matching jobs
+        # still appear in the rollup with a zero row.
         per_lib: dict[int, dict] = {
             r["id"]: {
                 "id": r["id"], "name": r["name"],
@@ -873,8 +884,9 @@ def create_app(
             "  LEFT JOIN media m ON m.id = j.media_id "
             "  LEFT JOIN tv_episodes te ON te.id = j.episode_id "
             "  LEFT JOIN media sm ON sm.id = te.show_id "
-            "  WHERE j.kind = 'asr'"
-            ") GROUP BY lib_id, status"
+            "  WHERE j.kind = ?"
+            ") GROUP BY lib_id, status",
+            (kind,),
         ).fetchall()
         for r in rows:
             lib_id = r["lib_id"]
@@ -884,9 +896,9 @@ def create_app(
             if status in per_lib[lib_id]:
                 per_lib[lib_id][status] = r["c"]
 
-        # What is the worker doing right now? At most one ASR job is in
-        # 'running' state at a time (single-threaded worker). Pull it +
-        # the human-readable title of what's being transcribed.
+        # What's running right now? Single-threaded worker so at most one
+        # job per kind. Pull it + the human-readable title of what's being
+        # processed so the page can show 'Worker is transcribing/encoding: …'
         running_row = conn.execute(
             "SELECT j.id AS job_id, j.media_id, j.episode_id, "
             "       j.started_at, "
@@ -897,8 +909,9 @@ def create_app(
             "LEFT JOIN media m ON m.id = j.media_id "
             "LEFT JOIN tv_episodes te ON te.id = j.episode_id "
             "LEFT JOIN media sm ON sm.id = te.show_id "
-            "WHERE j.kind = 'asr' AND j.status = 'running' "
-            "ORDER BY j.id LIMIT 1"
+            "WHERE j.kind = ? AND j.status = 'running' "
+            "ORDER BY j.id LIMIT 1",
+            (kind,),
         ).fetchone()
         current = None
         if running_row is not None:
@@ -925,20 +938,27 @@ def create_app(
             }
 
         return {
-            "worker_running": _asr.is_worker_in_process(),
-            "worker_available": _asr.is_available(),
+            "kind": kind,
+            "worker_running": worker_running,
+            "worker_available": worker_available,
             "current": current,
             "libraries": list(per_lib.values()),
         }
 
     @app.get("/api/admin/asr/library-status")
     def api_admin_asr_library_status(request: Request):
-        """JSON view of the same per-library rollup the page renders. The
-        bulk-ASR section polls this every few seconds so a) refreshes show
-        live state, and b) the user can see exactly which file the worker
-        is transcribing right now (across all libraries)."""
+        """JSON view of the per-library ASR rollup. Polled every few seconds
+        by /admin/subtitles so refreshes show live state and the user can
+        see exactly which file the worker is transcribing."""
         _require_admin(request)
-        return _compute_asr_library_status(_conn())
+        return _compute_jobs_library_status(_conn(), kind="asr")
+
+    @app.get("/api/admin/encode/library-status")
+    def api_admin_encode_library_status(request: Request):
+        """JSON view of the per-library encode rollup. Polled by
+        /admin/encode for the same refresh-stable live-status experience."""
+        _require_admin(request)
+        return _compute_jobs_library_status(_conn(), kind="encode")
 
     @app.post("/api/admin/encode/episode/{episode_id}")
     def api_admin_enqueue_episode_encode(episode_id: int, request: Request):
@@ -948,6 +968,57 @@ def create_app(
             raise HTTPException(404, "episode not found")
         job_id = encoder.enqueue_episode_encode(conn, episode_id)
         return {"ok": True, "job_id": job_id}
+
+    def _bulk_enqueue_encode_for_library(conn, library_id: int) -> int:
+        """Queue an encode job for every movie + episode in the library
+        that doesn't already have an encoded variant. Returns the count
+        of newly-queued jobs. Idempotent: re-running only enqueues items
+        without an existing encoded_files / encoded_episodes row."""
+        if conn.execute(
+            "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "library not found")
+        queued = 0
+        # Movies (and audiobooks — encoder.run_worker handles each kind):
+        # only those without an encoded_files row.
+        movies = conn.execute(
+            "SELECT m.id FROM media m "
+            "LEFT JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE m.library_id = ? AND m.kind = 'movie' "
+            "AND e.media_id IS NULL",
+            (library_id,),
+        ).fetchall()
+        for m in movies:
+            encoder.enqueue_encode(conn, m["id"])
+            queued += 1
+        # Episodes (members of any tv_show in the library): only those
+        # without an encoded_episodes row.
+        eps = conn.execute(
+            "SELECT e.id FROM tv_episodes e "
+            "JOIN media m ON m.id = e.show_id "
+            "LEFT JOIN encoded_episodes ee ON ee.episode_id = e.id "
+            "WHERE m.library_id = ? AND ee.episode_id IS NULL",
+            (library_id,),
+        ).fetchall()
+        for ep in eps:
+            encoder.enqueue_episode_encode(conn, ep["id"])
+            queued += 1
+        return queued
+
+    @app.post("/api/admin/encode/library/{library_id}")
+    def api_admin_enqueue_encode_library(library_id: int, request: Request):
+        _require_admin(request)
+        n = _bulk_enqueue_encode_for_library(_conn(), library_id)
+        return {"ok": True, "queued": n}
+
+    @app.post("/admin/encode/library/{library_id}")
+    def page_admin_enqueue_encode_library(library_id: int, request: Request):
+        _require_admin(request)
+        n = _bulk_enqueue_encode_for_library(_conn(), library_id)
+        return RedirectResponse(
+            f"/admin/encode?queued={n}&lib={library_id}",
+            status_code=303,
+        )
 
     # --- Admin: libraries (CRUD + scan) ---------------------------------
 
@@ -1460,9 +1531,14 @@ scanned automatically</strong> as soon as you add them.</p>
         return _page("Cleanup originals", body, user=user)
 
     @app.get("/admin/encode", response_class=HTMLResponse)
-    def page_admin_encode(request: Request):
+    def page_admin_encode(
+        request: Request,
+        queued: Optional[int] = None,
+        lib: Optional[int] = None,
+    ):
         user = _require_admin(request)
-        rows = _conn().execute(
+        conn = _conn()
+        rows = conn.execute(
             "SELECT m.id, m.kind, m.title_guess, l.name AS library "
             "FROM media m JOIN libraries l ON l.id = m.library_id "
             "LEFT JOIN encoded_files e ON e.media_id = m.id "
@@ -1470,11 +1546,43 @@ scanned automatically</strong> as soon as you add them.</p>
             "ORDER BY m.kind, m.title_guess "
             "LIMIT 200"
         ).fetchall()
+
+        # Bulk: server-rendered live dashboard. Reuses the same machinery
+        # as /admin/subtitles — refresh = same view across long encode runs.
+        bulk_html = _render_jobs_dashboard(
+            _compute_jobs_library_status(conn, kind="encode"),
+            kind="encode",
+            enqueue_url_prefix="/api/admin/encode/library/",
+            button_label="Encode everything in this library",
+            verb_present_continuous="encoding",
+            hint_html=(
+                "<p class='hint'>Queues an encode job for every movie and "
+                "episode in the library that doesn't already have an encoded "
+                "(H.264/AAC/MP4 1080p) version. Items already encoded are "
+                "skipped. Originals are kept until you confirm delete on "
+                "<a href='/admin/cleanup'>Cleanup</a>. <strong>This page "
+                "auto-refreshes</strong> — you can close it and reopen it "
+                "during a long run; live counts will pick up where you left off.</p>"
+            ),
+        )
+
+        # Flash from the form-redirect path.
+        flash_html = ""
+        if queued is not None:
+            if queued == 0:
+                flash_html = (
+                    "<p class='hint' style='color:#6c6'>Nothing new to queue — "
+                    "every item in that library already has an encoded version.</p>"
+                )
+            else:
+                flash_html = (
+                    f"<p class='hint' style='color:#6c6'>Queued {queued} encode "
+                    "job(s). Watch the live counts below.</p>"
+                )
+
         if not rows:
-            body = (
-                "<h2>Encode media</h2>"
-                "<p class='empty'>Everything in the library is already "
-                "encoded.</p><p><a href='/admin'>&larr; Admin</a></p>"
+            unencoded_html = (
+                "<p class='empty'>Everything in the library is already encoded.</p>"
             )
         else:
             row_html = "".join(
@@ -1487,18 +1595,27 @@ scanned automatically</strong> as soon as you add them.</p>
                 f"</td></tr>"
                 for r in rows
             )
-            body = (
-                "<h2>Encode media</h2>"
-                "<p class='hint'>One-shot encode to H.264/AAC/MP4 1080p. The "
-                "encoder worker (run via "
-                "<code>uv run cuttlefish encode-worker</code>) picks jobs up "
-                "from the queue. Originals are kept until you confirm delete.</p>"
+            unencoded_html = (
+                "<h3>Per-item (movies)</h3>"
+                "<p class='hint'>First 200 unencoded movies. For complete "
+                "library coverage including TV episodes, use the bulk button "
+                "above.</p>"
                 "<table class='admin'><thead><tr>"
                 "<th>library</th><th>kind</th><th>title</th><th></th>"
                 "</tr></thead><tbody>"
                 f"{row_html}</tbody></table>"
-                "<p><a href='/admin'>&larr; Admin</a></p>"
             )
+
+        body = (
+            "<h2>Encode media</h2>"
+            "<p class='hint'>One-shot encode to H.264/AAC/MP4 1080p. The "
+            "encode worker is auto-started by <code>./start.sh</code>. "
+            "Originals are kept until you confirm delete.</p>"
+            f"{flash_html}"
+            f"{bulk_html}"
+            f"{unencoded_html}"
+            "<p><a href='/admin'>&larr; Admin</a></p>"
+        )
         return _page("Encode", body, user=user)
 
     @app.post("/admin/encode/{media_id}")
@@ -1627,51 +1744,16 @@ scanned automatically</strong> as soon as you add them.</p>
         if not sections:
             sections.append("<p class='empty'>No movies or episodes scanned yet.</p>")
 
-        # Per-library bulk-ASR section. The page is its own dashboard —
-        # the worker indicator + per-library counts are server-rendered
-        # from the live job state, so refreshing during a bulk run shows
-        # the exact same view the JS would have polled to. The JS just
-        # re-renders these same cells every few seconds.
-        asr_state = _compute_asr_library_status(conn)
-        bulk_html = ""
-        if asr_state["libraries"]:
-            def _worker_html(state: dict) -> str:
-                cur = state.get("current")
-                if cur is not None:
-                    lib_part = (
-                        f" <span class='kind'>(library: {html.escape(cur['library_name'])})</span>"
-                        if cur.get("library_name") else ""
-                    )
-                    return (
-                        "<div id='asr-worker' class='asr-worker running'>"
-                        "<span class='asr-spinner' aria-hidden='true'></span> "
-                        "<strong>Worker is transcribing:</strong> "
-                        f"<span class='asr-current-title'>{html.escape(cur['title'])}</span>"
-                        f"{lib_part}"
-                        "</div>"
-                    )
-                return (
-                    "<div id='asr-worker' class='asr-worker idle'>"
-                    "<strong>Worker is idle.</strong> No ASR job is currently running."
-                    "</div>"
-                )
-            rows = "".join(
-                f"<tr data-lib-id='{lib_row['id']}'>"
-                f"<td>{html.escape(lib_row['name'])}</td>"
-                f"<td><button type='button' class='bulk-asr-btn' "
-                f"data-lib-id='{lib_row['id']}'>"
-                "Generate ASR for everything in this library</button></td>"
-                f"<td class='asr-cnt asr-queued'>{lib_row['queued']}</td>"
-                f"<td class='asr-cnt asr-running'>{lib_row['running']}</td>"
-                f"<td class='asr-cnt asr-done'>{lib_row['done']}</td>"
-                f"<td class='asr-cnt asr-failed'>{lib_row['failed']}</td>"
-                f"<td><span class='bulk-asr-status' "
-                f"data-lib-id='{lib_row['id']}'></span></td>"
-                f"</tr>"
-                for lib_row in asr_state["libraries"]
-            )
-            bulk_html = (
-                "<h3>Bulk: whole library</h3>"
+        # Per-library bulk-ASR section. Server-rendered from live job
+        # state and refreshed by JS via the matching library-status
+        # endpoint — refresh-stable.
+        bulk_html = _render_jobs_dashboard(
+            _compute_jobs_library_status(conn, kind="asr"),
+            kind="asr",
+            enqueue_url_prefix="/api/admin/asr/library/",
+            button_label="Generate ASR for everything in this library",
+            verb_present_continuous="transcribing",
+            hint_html=(
                 "<p class='hint'>Queues an ASR job for every movie and "
                 "episode in the library that doesn't already have an "
                 "auto-generated subtitle. Items with existing ASR are skipped — "
@@ -1679,15 +1761,8 @@ scanned automatically</strong> as soon as you add them.</p>
                 "want to redo one. <strong>This page auto-refreshes</strong> — "
                 "you can close it and reopen it during a long run; the live "
                 "counts will pick up where you left off.</p>"
-                f"{_worker_html(asr_state)}"
-                "<table class='admin'><thead><tr>"
-                "<th>library</th><th></th>"
-                "<th>queued</th><th>running</th><th>done</th><th>failed</th>"
-                "<th></th>"
-                "</tr></thead><tbody>"
-                f"{rows}</tbody></table>"
-                f"{_BULK_ASR_JS}"
-            )
+            ),
+        )
 
         # Flash message if we just came back from a bulk-enqueue redirect.
         flash_html = ""
@@ -2793,21 +2868,21 @@ body.watch .theater-meta h2 { margin-top: 0; }
 #gen-subs-status.running .asr-text  { color: #6cf; font-weight: 500; }
 #gen-subs-status.done    .asr-text  { color: #6c6; font-weight: 500; }
 #gen-subs-status.failed  .asr-text  { color: #f66; font-weight: 500; }
-.bulk-asr-status { display: inline-flex; align-items: center; gap: .5rem;
-                    font-size: .9em; }
-.bulk-asr-status.working .asr-text { color: #fc6; font-weight: 500; }
-.bulk-asr-status.running .asr-text { color: #6cf; font-weight: 500; }
-.bulk-asr-status.done    .asr-text { color: #6c6; font-weight: 500; }
-.bulk-asr-status.failed  .asr-text { color: #f66; font-weight: 500; }
-.asr-worker { background: #181818; border: 1px solid #333; border-radius: 4px;
-               padding: .75rem 1rem; margin: .5rem 0 1rem; line-height: 1.4; }
-.asr-worker.idle { color: #888; }
-.asr-worker.running { color: #eee; }
-.asr-worker .asr-current-title { color: #6cf; font-weight: 500; }
-.asr-cnt { font-variant-numeric: tabular-nums; text-align: right; min-width: 3em; }
-td.asr-cnt.asr-running { color: #6cf; font-weight: 500; }
-td.asr-cnt.asr-done    { color: #6c6; }
-td.asr-cnt.asr-failed  { color: #f66; }
+.bulk-jobs-status { display: inline-flex; align-items: center; gap: .5rem;
+                     font-size: .9em; }
+.bulk-jobs-status.working .asr-text { color: #fc6; font-weight: 500; }
+.bulk-jobs-status.running .asr-text { color: #6cf; font-weight: 500; }
+.bulk-jobs-status.done    .asr-text { color: #6c6; font-weight: 500; }
+.bulk-jobs-status.failed  .asr-text { color: #f66; font-weight: 500; }
+.jobs-worker { background: #181818; border: 1px solid #333; border-radius: 4px;
+                padding: .75rem 1rem; margin: .5rem 0 1rem; line-height: 1.4; }
+.jobs-worker.idle { color: #888; }
+.jobs-worker.running { color: #eee; }
+.jobs-worker .jobs-current-title { color: #6cf; font-weight: 500; }
+.jobs-cnt { font-variant-numeric: tabular-nums; text-align: right; min-width: 3em; }
+td.jobs-cnt.jobs-running { color: #6cf; font-weight: 500; }
+td.jobs-cnt.jobs-done    { color: #6c6; }
+td.jobs-cnt.jobs-failed  { color: #f66; }
 .asr-spinner { display: inline-block; width: 14px; height: 14px;
                 border: 2px solid currentColor; border-top-color: transparent;
                 border-radius: 50%; animation: asr-spin 0.8s linear infinite;
@@ -3251,16 +3326,17 @@ def _generate_subs_button_html(variants: dict, asr_url: str) -> str:
     )
 
 
-_BULK_ASR_JS = r"""
+_BULK_JOBS_JS = r"""
 <script>(function(){
-  // The page is its own live dashboard. We poll one endpoint
-  // (/api/admin/asr/library-status) and re-render the per-library cells +
-  // the global "what's transcribing right now" indicator. The bulk button
-  // just enqueues; everything else flows through the same renderer the
-  // initial page load used. Refresh at any time = same view.
-  var buttons = document.querySelectorAll('button.bulk-asr-btn');
-  var workerBox = document.getElementById('asr-worker');
-  if (!buttons.length && !workerBox) return;
+  // Generic per-library jobs dashboard. Drives both /admin/subtitles
+  // (kind=asr) and /admin/encode (kind=encode) from the same code: each
+  // page wraps its dashboard in a div with data-status-url, data-enqueue-
+  // url-prefix, and data-verb so the script knows where to poll, where to
+  // POST a bulk-enqueue, and what verb to display in the worker indicator.
+  // The page is its own live source of truth — refresh at any time and
+  // you see the same numbers the JS would have polled to.
+  var dashboards = document.querySelectorAll('.jobs-dashboard');
+  if (!dashboards.length) return;
 
   function escHtml(s) {
     if (s == null) return '';
@@ -3269,106 +3345,188 @@ _BULK_ASR_JS = r"""
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  function renderWorker(state) {
-    if (!workerBox) return;
-    var cur = state && state.current;
-    workerBox.classList.remove('idle', 'running');
-    if (cur) {
-      workerBox.classList.add('running');
-      var libPart = cur.library_name
-        ? ' <span class="kind">(library: ' + escHtml(cur.library_name) + ')</span>'
-        : '';
-      workerBox.innerHTML =
-        '<span class="asr-spinner" aria-hidden="true"></span> ' +
-        '<strong>Worker is transcribing:</strong> ' +
-        '<span class="asr-current-title">' + escHtml(cur.title) + '</span>' +
-        libPart;
-    } else {
-      workerBox.classList.add('idle');
-      workerBox.innerHTML =
-        '<strong>Worker is idle.</strong> No ASR job is currently running.';
+  dashboards.forEach(function(root) {
+    var statusUrl     = root.dataset.statusUrl;
+    var enqueuePrefix = root.dataset.enqueueUrlPrefix;
+    var verb          = root.dataset.verb || 'processing';
+    var kind          = root.dataset.kind || 'job';
+    var workerBox     = root.querySelector('.jobs-worker');
+    var buttons       = root.querySelectorAll('button.bulk-jobs-btn');
+
+    function renderWorker(state) {
+      if (!workerBox) return;
+      var cur = state && state.current;
+      workerBox.classList.remove('idle', 'running');
+      if (cur) {
+        workerBox.classList.add('running');
+        var libPart = cur.library_name
+          ? ' <span class="kind">(library: ' + escHtml(cur.library_name) + ')</span>'
+          : '';
+        workerBox.innerHTML =
+          '<span class="asr-spinner" aria-hidden="true"></span> ' +
+          '<strong>Worker is ' + escHtml(verb) + ':</strong> ' +
+          '<span class="jobs-current-title">' + escHtml(cur.title) + '</span>' +
+          libPart;
+      } else {
+        workerBox.classList.add('idle');
+        workerBox.innerHTML =
+          '<strong>Worker is idle.</strong> No ' + escHtml(kind) +
+          ' job is currently running.';
+      }
     }
-  }
 
-  function renderLibraries(state) {
-    (state.libraries || []).forEach(function(lib) {
-      var row = document.querySelector('tr[data-lib-id="' + lib.id + '"]');
-      if (!row) return;
-      var cells = {
-        queued: row.querySelector('.asr-queued'),
-        running: row.querySelector('.asr-running'),
-        done: row.querySelector('.asr-done'),
-        failed: row.querySelector('.asr-failed'),
-      };
-      Object.keys(cells).forEach(function(k) {
-        if (cells[k]) cells[k].textContent = String(lib[k] || 0);
-      });
-      // Re-enable the button if this library has no in-flight work.
-      var btn = row.querySelector('button.bulk-asr-btn');
-      var inflight = (lib.queued || 0) + (lib.running || 0);
-      if (btn && inflight === 0) btn.disabled = false;
-    });
-  }
-
-  function setLibStatusMsg(libId, state, text, spin) {
-    var span = document.querySelector(
-      '.bulk-asr-status[data-lib-id="' + libId + '"]'
-    );
-    if (!span) return;
-    span.classList.remove('idle', 'working', 'running', 'done', 'failed');
-    span.classList.add(state);
-    var spinner = spin
-      ? '<span class="asr-spinner" aria-hidden="true"></span> '
-      : '';
-    span.innerHTML = spinner + '<span class="asr-text">' + text + '</span>';
-  }
-
-  function refresh() {
-    fetch('/api/admin/asr/library-status', { credentials: 'same-origin' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(state) {
-        if (!state) return;
-        renderWorker(state);
-        renderLibraries(state);
-      })
-      .catch(function() { /* network blip — try again on next tick */ });
-  }
-
-  buttons.forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      var libId = btn.dataset.libId;
-      btn.disabled = true;
-      setLibStatusMsg(libId, 'working', 'Scanning the library and queuing jobs…', true);
-      fetch('/api/admin/asr/library/' + libId, { method: 'POST' })
-        .then(function(r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          return r.json();
-        })
-        .then(function(j) {
-          if (!j.queued) {
-            setLibStatusMsg(libId, 'done',
-              'Nothing to queue — every item already has an ASR variant.',
-              false);
-            btn.disabled = false;
-            return;
-          }
-          setLibStatusMsg(libId, 'running',
-            'Queued ' + j.queued + ' new job(s).', false);
-          refresh();
-        })
-        .catch(function(e) {
-          setLibStatusMsg(libId, 'failed', 'Queue failed: ' + e.message, false);
-          btn.disabled = false;
+    function renderLibraries(state) {
+      (state.libraries || []).forEach(function(lib) {
+        var row = root.querySelector('tr[data-lib-id="' + lib.id + '"]');
+        if (!row) return;
+        ['queued', 'running', 'done', 'failed'].forEach(function(k) {
+          var cell = row.querySelector('.jobs-' + k);
+          if (cell) cell.textContent = String(lib[k] || 0);
         });
-    });
-  });
+        // Re-enable the button when this library has no in-flight work.
+        var btn = row.querySelector('button.bulk-jobs-btn');
+        var inflight = (lib.queued || 0) + (lib.running || 0);
+        if (btn && inflight === 0) btn.disabled = false;
+      });
+    }
 
-  // Always poll, regardless of whether the user clicked a button. That way
-  // a page refresh during a previous bulk run shows the live state too.
-  refresh();
-  setInterval(refresh, 3000);
+    function setLibStatusMsg(libId, state, text, spin) {
+      var span = root.querySelector(
+        '.bulk-jobs-status[data-lib-id="' + libId + '"]'
+      );
+      if (!span) return;
+      span.classList.remove('idle', 'working', 'running', 'done', 'failed');
+      span.classList.add(state);
+      var spinner = spin
+        ? '<span class="asr-spinner" aria-hidden="true"></span> '
+        : '';
+      span.innerHTML = spinner + '<span class="asr-text">' + text + '</span>';
+    }
+
+    function refresh() {
+      fetch(statusUrl, { credentials: 'same-origin' })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(state) {
+          if (!state) return;
+          renderWorker(state);
+          renderLibraries(state);
+        })
+        .catch(function() { /* network blip — try again on next tick */ });
+    }
+
+    buttons.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var libId = btn.dataset.libId;
+        btn.disabled = true;
+        setLibStatusMsg(libId, 'working',
+          'Scanning the library and queuing jobs…', true);
+        fetch(enqueuePrefix + libId, { method: 'POST' })
+          .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function(j) {
+            if (!j.queued) {
+              setLibStatusMsg(libId, 'done',
+                'Nothing to queue — everything already has a ' + kind + ' variant.',
+                false);
+              btn.disabled = false;
+              return;
+            }
+            setLibStatusMsg(libId, 'running',
+              'Queued ' + j.queued + ' new job(s).', false);
+            refresh();
+          })
+          .catch(function(e) {
+            setLibStatusMsg(libId, 'failed',
+              'Queue failed: ' + e.message, false);
+            btn.disabled = false;
+          });
+      });
+    });
+
+    // Always poll, regardless of whether the user clicked a button. That
+    // way a page refresh during a previous bulk run shows live state too.
+    refresh();
+    setInterval(refresh, 3000);
+  });
 })();</script>
 """
+
+
+def _render_jobs_dashboard(
+    state: dict,
+    *,
+    kind: str,
+    enqueue_url_prefix: str,
+    button_label: str,
+    verb_present_continuous: str,
+    hint_html: str,
+) -> str:
+    """Server-render the per-library jobs dashboard used by both
+    /admin/subtitles (kind='asr') and /admin/encode (kind='encode').
+
+    `state` comes from `_compute_jobs_library_status(conn, kind)`. The
+    JS in `_BULK_JOBS_JS` reads the URL/verb metadata from data-attrs
+    on the wrapping `.jobs-dashboard` div, so the page stays the source
+    of truth across refreshes.
+    """
+    if not state["libraries"]:
+        return ""
+    cur = state.get("current")
+    if cur is not None:
+        lib_part = (
+            f" <span class='kind'>(library: {html.escape(cur['library_name'])})</span>"
+            if cur.get("library_name") else ""
+        )
+        worker_html = (
+            "<div class='jobs-worker running'>"
+            "<span class='asr-spinner' aria-hidden='true'></span> "
+            f"<strong>Worker is {html.escape(verb_present_continuous)}:</strong> "
+            f"<span class='jobs-current-title'>{html.escape(cur['title'])}</span>"
+            f"{lib_part}"
+            "</div>"
+        )
+    else:
+        worker_html = (
+            "<div class='jobs-worker idle'>"
+            f"<strong>Worker is idle.</strong> No {html.escape(kind)} job is currently running."
+            "</div>"
+        )
+    rows = "".join(
+        f"<tr data-lib-id='{lib_row['id']}'>"
+        f"<td>{html.escape(lib_row['name'])}</td>"
+        f"<td><button type='button' class='bulk-jobs-btn' "
+        f"data-lib-id='{lib_row['id']}'>"
+        f"{html.escape(button_label)}</button></td>"
+        f"<td class='jobs-cnt jobs-queued'>{lib_row['queued']}</td>"
+        f"<td class='jobs-cnt jobs-running'>{lib_row['running']}</td>"
+        f"<td class='jobs-cnt jobs-done'>{lib_row['done']}</td>"
+        f"<td class='jobs-cnt jobs-failed'>{lib_row['failed']}</td>"
+        f"<td><span class='bulk-jobs-status' "
+        f"data-lib-id='{lib_row['id']}'></span></td>"
+        f"</tr>"
+        for lib_row in state["libraries"]
+    )
+    status_url = f"/api/admin/{kind}/library-status"
+    return (
+        f"<div class='jobs-dashboard' "
+        f"data-status-url='{html.escape(status_url)}' "
+        f"data-enqueue-url-prefix='{html.escape(enqueue_url_prefix)}' "
+        f"data-verb='{html.escape(verb_present_continuous)}' "
+        f"data-kind='{html.escape(kind)}'>"
+        "<h3>Bulk: whole library</h3>"
+        f"{hint_html}"
+        f"{worker_html}"
+        "<table class='admin'><thead><tr>"
+        "<th>library</th><th></th>"
+        "<th>queued</th><th>running</th><th>done</th><th>failed</th>"
+        "<th></th>"
+        "</tr></thead><tbody>"
+        f"{rows}</tbody></table>"
+        f"{_BULK_JOBS_JS}"
+        "</div>"
+    )
 
 
 _GEN_SUBS_JS = r"""
