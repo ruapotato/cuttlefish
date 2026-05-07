@@ -35,6 +35,10 @@ def fake_nemo(monkeypatch):
     can run end-to-end without the actual GPU/ML stack."""
     if not _torch_importable():
         pytest.skip("torch not importable in this venv")
+    # The model is cached at module level for performance — clear it so
+    # this test gets a fresh load (and so the fixture's mock is what we
+    # see, not a stale cached instance from a previous test).
+    asr._MODEL_CACHE.clear()
     # ---- fake nemo.collections.asr -----------------------------------
     fake_model = MagicMock()
     fake_model.transcribe.return_value = [
@@ -119,6 +123,7 @@ def test_short_audio_is_one_chunk(tmp_path, monkeypatch):
     """Audio shorter than chunk_secs → one transcribe call, cues unshifted."""
     if not _torch_importable():
         pytest.skip("torch not importable in this venv")
+    asr._MODEL_CACHE.clear()
     fake_model = MagicMock()
     fake_model.transcribe.return_value = [
         types.SimpleNamespace(
@@ -152,3 +157,34 @@ def test_short_audio_is_one_chunk(tmp_path, monkeypatch):
     assert fake_model.transcribe.call_count == 1
     # No offset since it was the first (and only) chunk; SRT comma-separator.
     assert "00:00:00,100" in out.read_text()
+
+
+def test_model_loaded_once_across_jobs(tmp_path, fake_nemo, monkeypatch):
+    """Calling transcribe_to_srt twice should hit from_pretrained() exactly
+    ONCE — the model is cached at module level so subsequent jobs reuse it.
+
+    Without this cache the worker burns several seconds per job re-loading
+    the .nemo file from disk + re-initializing the GPU graph, which is the
+    dominant cost on libraries of short videos.
+    """
+    monkeypatch.setenv("CUTTLEFISH_ASR_CHUNK_SECS", "60")
+    import nemo.collections.asr as nemo_asr_mod
+    from_pretrained = nemo_asr_mod.models.ASRModel.from_pretrained
+
+    asr.transcribe_to_srt(
+        video_path=tmp_path / "first.mp4",
+        output_srt=tmp_path / "first.srt",
+    )
+    asr.transcribe_to_srt(
+        video_path=tmp_path / "second.mp4",
+        output_srt=tmp_path / "second.srt",
+    )
+    asr.transcribe_to_srt(
+        video_path=tmp_path / "third.mp4",
+        output_srt=tmp_path / "third.srt",
+    )
+    assert from_pretrained.call_count == 1, (
+        f"Parakeet model was reloaded {from_pretrained.call_count} times "
+        "across 3 transcribe_to_srt calls — should have loaded once and "
+        "cached. Check _MODEL_CACHE in workers/asr.py."
+    )

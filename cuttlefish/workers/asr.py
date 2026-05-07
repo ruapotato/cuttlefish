@@ -167,6 +167,43 @@ def _force_cpu_if_cuda_broken() -> None:
         torch.cuda.is_available = lambda: False  # type: ignore[assignment]
 
 
+# Module-level model cache. Loading the .nemo file + moving to GPU is the
+# slow part (~3-10s); transcribing a 30s chunk takes <0.1s on a 4090. The
+# worker processes jobs sequentially in one thread, so a single cached
+# model is correct and dramatically faster than reloading per job.
+_MODEL_CACHE: dict[str, object] = {}
+
+
+def _get_or_load_model(model_id: str):
+    """Load and cache the Parakeet ASR model. Subsequent calls in the same
+    process return the cached instance — no disk I/O, no GPU re-init."""
+    cached = _MODEL_CACHE.get(model_id)
+    if cached is not None:
+        return cached
+    import nemo.collections.asr as nemo_asr  # type: ignore
+    import torch  # type: ignore
+    log.info("loading Parakeet model %s (first time — caching for subsequent jobs)", model_id)
+    try:
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
+    except RuntimeError as e:
+        msg = str(e)
+        if "NVIDIA driver" in msg or "CUDA driver" in msg:
+            raise RuntimeError(
+                "Could not load the Parakeet model on this GPU because "
+                "the installed PyTorch was built for a newer CUDA "
+                "driver than this machine has. Restart with "
+                "`CUTTLEFISH_ASR_CPU=1 ./start.sh` (or pass `--asr-cpu` "
+                "to start.sh) to run on CPU instead."
+            ) from e
+        raise
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    log.info("loaded Parakeet on %s (cached for subsequent jobs)", device)
+    _MODEL_CACHE[model_id] = model
+    return model
+
+
 def transcribe_to_srt(
     video_path: Path,
     output_srt: Path,
@@ -188,7 +225,6 @@ def transcribe_to_srt(
     import numpy as np  # type: ignore
     import soundfile as sf  # type: ignore
     import torch  # type: ignore
-    import nemo.collections.asr as nemo_asr  # type: ignore
 
     # A whole movie's audio at once blows past most GPU memory budgets.
     # Chunk into N-second windows, transcribe each, then concatenate
@@ -199,24 +235,9 @@ def transcribe_to_srt(
     with tempfile.TemporaryDirectory() as td:
         wav = Path(td) / "audio.wav"
         extract_audio_for_asr(video_path, wav, ffmpeg=ffmpeg)
-        log.info("loading Parakeet model %s", model_id)
-        try:
-            model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
-        except RuntimeError as e:
-            msg = str(e)
-            if "NVIDIA driver" in msg or "CUDA driver" in msg:
-                raise RuntimeError(
-                    "Could not load the Parakeet model on this GPU because "
-                    "the installed PyTorch was built for a newer CUDA "
-                    "driver than this machine has. Restart with "
-                    "`CUTTLEFISH_ASR_CPU=1 ./start.sh` (or pass `--asr-cpu` "
-                    "to start.sh) to run on CPU instead."
-                ) from e
-            raise
+        model = _get_or_load_model(model_id)
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        model.to(device)
-        model.eval()
-        log.info("loaded Parakeet on %s; transcribing %s", device, video_path)
+        log.info("transcribing %s on %s", video_path, device)
 
         # NumPy-array path skips NeMo's Lhotse dataloader (which spawns
         # subprocess workers and hangs in a daemon thread).

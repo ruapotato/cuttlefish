@@ -140,118 +140,159 @@ def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
         asr._worker_in_process = False  # reset for other tests
 
 
-def test_jobs_by_ids_endpoint_returns_status_counts(tmp_path):
-    """The bulk progress poller scopes to specific job IDs via this endpoint
-    so it doesn't get skewed by unrelated ASR jobs queued elsewhere."""
+def test_asr_library_status_aggregates_per_library(tmp_path):
+    """The page polls one endpoint that returns per-library {queued, running,
+    done, failed} counts so a refresh during a long bulk run shows the same
+    live state the JS would have driven to."""
     if FFMPEG is None:
         pytest.skip("ffmpeg not installed")
     from fastapi.testclient import TestClient
     from cuttlefish.server import create_app
 
-    root = tmp_path / "media"; root.mkdir()
-    _make_video(root / "A.mp4")
-    _make_video(root / "B.mp4")
-    _make_video(root / "C.mp4")
+    movies_root = tmp_path / "movies"; movies_root.mkdir()
+    _make_video(movies_root / "A.mp4")
+    _make_video(movies_root / "B.mp4")
+    other_root = tmp_path / "other"; other_root.mkdir()
+    _make_video(other_root / "C.mp4")
+
     db_path = tmp_path / "t.db"
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
-        cur = conn.execute(
-            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
-            (str(root),),
+        cur1 = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('movies', ?)",
+            (str(movies_root),),
         )
-    scanner.scan_library(conn, cur.lastrowid, root)
-    media_ids = [r["id"] for r in conn.execute("SELECT id FROM media").fetchall()]
-    job_ids = []
+        lib_movies = cur1.lastrowid
+        cur2 = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('other', ?)",
+            (str(other_root),),
+        )
+        lib_other = cur2.lastrowid
+    scanner.scan_library(conn, lib_movies, movies_root)
+    scanner.scan_library(conn, lib_other, other_root)
+    movie_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM media WHERE library_id = ?", (lib_movies,)
+    ).fetchall()]
+    other_id = conn.execute(
+        "SELECT id FROM media WHERE library_id = ?", (lib_other,)
+    ).fetchone()["id"]
+
     with conn:
-        for mid in media_ids:
-            c = conn.execute("INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (mid,))
-            job_ids.append(c.lastrowid)
-        # Also queue an unrelated ASR job — should NOT affect the scoped count.
-        conn.execute("INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (media_ids[0],))
-        # Mark one of OUR jobs as done, one as failed.
-        conn.execute("UPDATE jobs SET status = 'done' WHERE id = ?", (job_ids[0],))
-        conn.execute("UPDATE jobs SET status = 'failed', error = 'boom' WHERE id = ?", (job_ids[1],))
-        # The unrelated job stays 'queued'.
+        # movies: 1 done, 1 queued
+        conn.execute(
+            "INSERT INTO jobs (kind, media_id, status) VALUES ('asr', ?, 'done')",
+            (movie_ids[0],),
+        )
+        conn.execute(
+            "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)",
+            (movie_ids[1],),
+        )
+        # other: 1 running
+        conn.execute(
+            "INSERT INTO jobs (kind, media_id, status) VALUES ('asr', ?, 'running')",
+            (other_id,),
+        )
+
     client = TestClient(create_app(db_path=db_path))
     client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
     client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
-
-    ids_str = ",".join(str(i) for i in job_ids)
-    r = client.get(f"/api/admin/jobs/by-ids?ids={ids_str}")
+    r = client.get("/api/admin/asr/library-status")
     assert r.status_code == 200
     body = r.json()
-    # Scoped counts: 1 done, 1 failed, 1 queued, 0 running. The unrelated
-    # 'queued' job is NOT counted because its ID isn't in the list.
-    assert body == {"queued": 1, "running": 0, "done": 1, "failed": 1}
+    libs = {l["id"]: l for l in body["libraries"]}
+    assert libs[lib_movies]["queued"] == 1
+    assert libs[lib_movies]["done"] == 1
+    assert libs[lib_movies]["running"] == 0
+    assert libs[lib_other]["running"] == 1
+    assert libs[lib_other]["queued"] == 0
 
 
-def test_jobs_by_ids_empty_input(tmp_path):
-    if FFMPEG is None:
-        pytest.skip("ffmpeg not installed")
-    from fastapi.testclient import TestClient
-    from cuttlefish.server import create_app
-    db_path = tmp_path / "t.db"
-    db.init_schema(db.connect(db_path))
-    client = TestClient(create_app(db_path=db_path))
-    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
-    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
-    # Empty / missing ids → all-zero, not 400
-    r = client.get("/api/admin/jobs/by-ids?ids=")
-    assert r.status_code == 200
-    assert r.json() == {"queued": 0, "running": 0, "done": 0, "failed": 0}
-    r2 = client.get("/api/admin/jobs/by-ids")
-    assert r2.status_code == 200
-
-
-def test_jobs_by_ids_rejects_non_integer(tmp_path):
-    if FFMPEG is None:
-        pytest.skip("ffmpeg not installed")
-    from fastapi.testclient import TestClient
-    from cuttlefish.server import create_app
-    db_path = tmp_path / "t.db"
-    db.init_schema(db.connect(db_path))
-    client = TestClient(create_app(db_path=db_path))
-    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
-    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
-    r = client.get("/api/admin/jobs/by-ids?ids=abc,def")
-    assert r.status_code == 400
-
-
-def test_bulk_asr_returns_job_ids(tmp_path):
-    """The bulk endpoint returns the IDs it inserted so the UI can scope
-    its progress polling to exactly those jobs."""
+def test_asr_library_status_shows_currently_transcribing_title(tmp_path):
+    """When a job is in 'running' state the response identifies what file is
+    being transcribed so the page can show 'Worker is transcribing: …'.
+    This is the bit that prevents the user from thinking the system is
+    broken when the worker is busy on a different library's older job."""
     if FFMPEG is None:
         pytest.skip("ffmpeg not installed")
     from fastapi.testclient import TestClient
     from cuttlefish.server import create_app
 
     root = tmp_path / "media"; root.mkdir()
-    _make_video(root / "A.mp4")
-    _make_video(root / "B.mp4")
+    _make_video(root / "Tiny.mp4")
     db_path = tmp_path / "t.db"
     conn = db.connect(db_path); db.init_schema(conn)
     with conn:
         cur = conn.execute(
-            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            "INSERT INTO libraries (name, root_path) VALUES ('lib', ?)",
             (str(root),),
         )
         lib_id = cur.lastrowid
     scanner.scan_library(conn, lib_id, root)
+    media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
+    with conn:
+        conn.execute(
+            "INSERT INTO jobs (kind, media_id, status) VALUES ('asr', ?, 'running')",
+            (media_id,),
+        )
+
     client = TestClient(create_app(db_path=db_path))
     client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
     client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
-    r = client.post(f"/api/admin/asr/library/{lib_id}")
+    r = client.get("/api/admin/asr/library-status")
     assert r.status_code == 200
     body = r.json()
-    assert body["queued"] == 2
-    assert "job_ids" in body
-    assert len(body["job_ids"]) == 2
-    # Confirm those IDs actually exist as ASR jobs.
-    rows = conn.execute(
-        f"SELECT id, kind, status FROM jobs WHERE id IN ({','.join('?' * len(body['job_ids']))})",
-        body["job_ids"],
-    ).fetchall()
-    assert all(r["kind"] == "asr" and r["status"] == "queued" for r in rows)
+    assert body["current"] is not None
+    assert body["current"]["library_id"] == lib_id
+    assert body["current"]["library_name"] == "lib"
+    # The title should be readable — at least non-empty and matching the
+    # scanned title for the file we created.
+    assert body["current"]["title"]
+
+
+def test_asr_library_status_idle_when_nothing_running(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+    db_path = tmp_path / "t.db"
+    db.init_schema(db.connect(db_path))
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    r = client.get("/api/admin/asr/library-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["current"] is None
+
+
+def test_admin_subtitles_page_renders_running_indicator_for_refresh(tmp_path):
+    """A page refresh during a bulk run should show the same live worker
+    indicator the JS would have rendered. This is what keeps the user from
+    thinking the system is hung when the page reloads mid-job."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, db_path, media_id = _admin_client_with_movie(tmp_path)
+    conn = db.connect(db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO jobs (kind, media_id, status) VALUES ('asr', ?, 'running')",
+            (media_id,),
+        )
+    r = client.get("/admin/subtitles")
+    assert r.status_code == 200
+    # The rendered worker div should be in 'running' state (not the JS-only
+    # idle text that lives inside the script tag).
+    assert "<div id='asr-worker' class='asr-worker running'>" in r.text
+    assert "Worker is transcribing:" in r.text
+
+
+def test_admin_subtitles_page_renders_idle_indicator_when_no_jobs(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, _ = _admin_client_with_movie(tmp_path)
+    r = client.get("/admin/subtitles")
+    assert r.status_code == 200
+    assert "<div id='asr-worker' class='asr-worker idle'>" in r.text
 
 
 def test_bulk_asr_for_library_queues_everything_without_existing_asr(tmp_path):
@@ -355,10 +396,17 @@ def test_admin_subtitles_page_has_bulk_section(tmp_path):
     assert "class='bulk-asr-btn'" in r.text
     assert "class='bulk-asr-status'" in r.text
     assert "data-lib-id=" in r.text
-    # Polling URL referenced from the inline JS — scoped to this submit's
-    # job IDs (not the global ASR queue) so unrelated ASR jobs don't skew
-    # the progress display.
-    assert "/api/admin/jobs/by-ids" in r.text
+    # The page is its own dashboard: it polls a single per-library status
+    # endpoint and re-renders the cells. Refresh = same view.
+    assert "/api/admin/asr/library-status" in r.text
+    # Per-library count cells are server-rendered so a refresh shows the
+    # live state immediately without waiting for the first JS poll.
+    assert "asr-queued" in r.text
+    assert "asr-running" in r.text
+    assert "asr-done" in r.text
+    assert "asr-failed" in r.text
+    # Worker-activity indicator is always present (idle or running variant).
+    assert "id='asr-worker'" in r.text or 'id="asr-worker"' in r.text
 
 
 def test_admin_subtitles_shows_pending_count(tmp_path):

@@ -575,43 +575,6 @@ def create_app(
         job_id = encoder.enqueue_encode(conn, media_id)
         return {"ok": True, "job_id": job_id}
 
-    @app.get("/api/admin/jobs/by-ids")
-    def api_admin_jobs_by_ids(request: Request, ids: str = ""):
-        """Return per-status counts for the specified job IDs. Used by the
-        bulk-ASR progress poller so it tracks just the jobs THIS click
-        created, not the global ASR queue.
-
-        ids: comma-separated integer job IDs.
-        Returns: {queued, running, done, failed}
-
-        IMPORTANT: this route must be declared BEFORE
-        `/api/admin/jobs/{job_id}` — otherwise FastAPI matches `by-ids`
-        as a path parameter and returns 422.
-        """
-        _require_admin(request)
-        if not ids.strip():
-            return {"queued": 0, "running": 0, "done": 0, "failed": 0}
-        try:
-            id_list = [int(x) for x in ids.split(",") if x.strip()]
-        except ValueError:
-            raise HTTPException(400, "ids must be comma-separated integers")
-        if not id_list:
-            return {"queued": 0, "running": 0, "done": 0, "failed": 0}
-        # SQLite has a parameter-count limit (default 999). Chunk the lookup
-        # so a giant bulk submission still works.
-        counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
-        for start in range(0, len(id_list), 800):
-            chunk = id_list[start:start + 800]
-            placeholders = ",".join(["?"] * len(chunk))
-            rows = _conn().execute(
-                f"SELECT status, COUNT(*) AS c FROM jobs "
-                f"WHERE id IN ({placeholders}) GROUP BY status",
-                chunk,
-            ).fetchall()
-            for r in rows:
-                counts[r["status"]] = counts.get(r["status"], 0) + r["c"]
-        return counts
-
     @app.get("/api/admin/jobs/{job_id}")
     def api_admin_get_job(job_id: int, request: Request):
         _require_admin(request)
@@ -810,17 +773,15 @@ def create_app(
             )
         return {"ok": True, "job_id": cur.lastrowid}
 
-    def _bulk_enqueue_asr_for_library(conn, library_id: int) -> list[int]:
+    def _bulk_enqueue_asr_for_library(conn, library_id: int) -> int:
         """Queue an ASR job for every movie + episode in the library that
-        doesn't already have an ASR variant on disk. Returns the list of
-        newly-created job IDs so the caller / UI can track *just these*
-        jobs to completion (vs the global ASR queue count, which can
-        include unrelated work)."""
+        doesn't already have an ASR variant on disk. Returns the count of
+        newly-queued jobs."""
         if conn.execute(
             "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
         ).fetchone() is None:
             raise HTTPException(404, "library not found")
-        job_ids: list[int] = []
+        queued = 0
         movies = conn.execute(
             "SELECT id FROM media WHERE library_id = ? AND kind = 'movie'",
             (library_id,),
@@ -830,10 +791,10 @@ def create_app(
             if "asr" in variants:
                 continue
             with conn:
-                cur = conn.execute(
+                conn.execute(
                     "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (m["id"],)
                 )
-            job_ids.append(cur.lastrowid)
+            queued += 1
         eps = conn.execute(
             "SELECT e.id FROM tv_episodes e "
             "JOIN media m ON m.id = e.show_id "
@@ -845,24 +806,24 @@ def create_app(
             if "asr" in variants:
                 continue
             with conn:
-                cur = conn.execute(
+                conn.execute(
                     "INSERT INTO jobs (kind, episode_id) VALUES ('asr', ?)", (e["id"],)
                 )
-            job_ids.append(cur.lastrowid)
-        return job_ids
+            queued += 1
+        return queued
 
     @app.post("/api/admin/asr/library/{library_id}")
     def api_admin_enqueue_asr_library(library_id: int, request: Request):
         _require_admin(request)
-        ids = _bulk_enqueue_asr_for_library(_conn(), library_id)
-        return {"ok": True, "queued": len(ids), "job_ids": ids}
+        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        return {"ok": True, "queued": n}
 
     @app.post("/admin/asr/library/{library_id}")
     def page_admin_enqueue_asr_library(library_id: int, request: Request):
         _require_admin(request)
-        ids = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
         return RedirectResponse(
-            f"/admin/subtitles?queued={len(ids)}&lib={library_id}",
+            f"/admin/subtitles?queued={n}&lib={library_id}",
             status_code=303,
         )
 
@@ -878,6 +839,106 @@ def create_app(
             "worker_in_process": _asr.is_worker_in_process(),
             "queued": pending,
         }
+
+    def _compute_asr_library_status(conn) -> dict:
+        """Per-library ASR job rollup + 'what is the worker on right now'.
+
+        Single source of truth for both the server-rendered initial page
+        load and the JSON polling endpoint, so a refresh during a bulk run
+        shows the exact same display the JS would have driven to.
+        """
+        from cuttlefish.workers import asr as _asr
+
+        # Per-library counts. Jobs link to a library either through media
+        # directly OR through a tv_episode whose show is itself a media row.
+        libs = conn.execute(
+            "SELECT id, name FROM libraries ORDER BY id"
+        ).fetchall()
+        # Pre-seed every library so libraries with zero ASR jobs still appear.
+        per_lib: dict[int, dict] = {
+            r["id"]: {
+                "id": r["id"], "name": r["name"],
+                "queued": 0, "running": 0, "done": 0, "failed": 0,
+            } for r in libs
+        }
+        # Wrap in a subquery: GROUP BY <alias> doesn't see the SELECT
+        # alias when both joined media tables also have a `library_id`
+        # column (SQLite emits "ambiguous column name").
+        rows = conn.execute(
+            "SELECT lib_id, status, COUNT(*) AS c FROM ("
+            "  SELECT "
+            "    COALESCE(m.library_id, sm.library_id) AS lib_id, "
+            "    j.status AS status "
+            "  FROM jobs j "
+            "  LEFT JOIN media m ON m.id = j.media_id "
+            "  LEFT JOIN tv_episodes te ON te.id = j.episode_id "
+            "  LEFT JOIN media sm ON sm.id = te.show_id "
+            "  WHERE j.kind = 'asr'"
+            ") GROUP BY lib_id, status"
+        ).fetchall()
+        for r in rows:
+            lib_id = r["lib_id"]
+            if lib_id is None or lib_id not in per_lib:
+                continue
+            status = r["status"]
+            if status in per_lib[lib_id]:
+                per_lib[lib_id][status] = r["c"]
+
+        # What is the worker doing right now? At most one ASR job is in
+        # 'running' state at a time (single-threaded worker). Pull it +
+        # the human-readable title of what's being transcribed.
+        running_row = conn.execute(
+            "SELECT j.id AS job_id, j.media_id, j.episode_id, "
+            "       j.started_at, "
+            "       m.library_id AS m_lib, m.title_guess AS m_title, "
+            "       sm.id AS show_id, sm.library_id AS sm_lib, sm.title_guess AS show_title, "
+            "       te.season, te.episode, te.title_guess AS ep_title "
+            "FROM jobs j "
+            "LEFT JOIN media m ON m.id = j.media_id "
+            "LEFT JOIN tv_episodes te ON te.id = j.episode_id "
+            "LEFT JOIN media sm ON sm.id = te.show_id "
+            "WHERE j.kind = 'asr' AND j.status = 'running' "
+            "ORDER BY j.id LIMIT 1"
+        ).fetchone()
+        current = None
+        if running_row is not None:
+            if running_row["episode_id"] is not None:
+                ep_label = (
+                    f"S{int(running_row['season']):02d}E{int(running_row['episode']):02d}"
+                    if running_row["season"] is not None
+                    and running_row["episode"] is not None
+                    else ""
+                )
+                ep_title = running_row["ep_title"] or ""
+                show = running_row["show_title"] or "(unknown show)"
+                title = " ".join(p for p in [show, ep_label, ep_title] if p).strip()
+                lib_id = running_row["sm_lib"]
+            else:
+                title = running_row["m_title"] or "(unknown)"
+                lib_id = running_row["m_lib"]
+            current = {
+                "job_id": running_row["job_id"],
+                "title": title,
+                "library_id": lib_id,
+                "library_name": per_lib.get(lib_id, {}).get("name") if lib_id else None,
+                "started_at": running_row["started_at"],
+            }
+
+        return {
+            "worker_running": _asr.is_worker_in_process(),
+            "worker_available": _asr.is_available(),
+            "current": current,
+            "libraries": list(per_lib.values()),
+        }
+
+    @app.get("/api/admin/asr/library-status")
+    def api_admin_asr_library_status(request: Request):
+        """JSON view of the same per-library rollup the page renders. The
+        bulk-ASR section polls this every few seconds so a) refreshes show
+        live state, and b) the user can see exactly which file the worker
+        is transcribing right now (across all libraries)."""
+        _require_admin(request)
+        return _compute_asr_library_status(_conn())
 
     @app.post("/api/admin/encode/episode/{episode_id}")
     def api_admin_enqueue_episode_encode(episode_id: int, request: Request):
@@ -1566,26 +1627,48 @@ scanned automatically</strong> as soon as you add them.</p>
         if not sections:
             sections.append("<p class='empty'>No movies or episodes scanned yet.</p>")
 
-        # Per-library bulk-ASR section. Each library has a JS-driven
-        # button that posts to /api/admin/asr/library/{id} and then polls
-        # /api/admin/asr-status to surface 'N jobs remaining' inline.
-        # Idempotent: re-running only enqueues items that don't already
-        # have an ASR variant.
-        libs = conn.execute(
-            "SELECT id, name FROM libraries ORDER BY id"
-        ).fetchall()
+        # Per-library bulk-ASR section. The page is its own dashboard —
+        # the worker indicator + per-library counts are server-rendered
+        # from the live job state, so refreshing during a bulk run shows
+        # the exact same view the JS would have polled to. The JS just
+        # re-renders these same cells every few seconds.
+        asr_state = _compute_asr_library_status(conn)
         bulk_html = ""
-        if libs:
+        if asr_state["libraries"]:
+            def _worker_html(state: dict) -> str:
+                cur = state.get("current")
+                if cur is not None:
+                    lib_part = (
+                        f" <span class='kind'>(library: {html.escape(cur['library_name'])})</span>"
+                        if cur.get("library_name") else ""
+                    )
+                    return (
+                        "<div id='asr-worker' class='asr-worker running'>"
+                        "<span class='asr-spinner' aria-hidden='true'></span> "
+                        "<strong>Worker is transcribing:</strong> "
+                        f"<span class='asr-current-title'>{html.escape(cur['title'])}</span>"
+                        f"{lib_part}"
+                        "</div>"
+                    )
+                return (
+                    "<div id='asr-worker' class='asr-worker idle'>"
+                    "<strong>Worker is idle.</strong> No ASR job is currently running."
+                    "</div>"
+                )
             rows = "".join(
-                f"<tr>"
+                f"<tr data-lib-id='{lib_row['id']}'>"
                 f"<td>{html.escape(lib_row['name'])}</td>"
                 f"<td><button type='button' class='bulk-asr-btn' "
                 f"data-lib-id='{lib_row['id']}'>"
                 "Generate ASR for everything in this library</button></td>"
+                f"<td class='asr-cnt asr-queued'>{lib_row['queued']}</td>"
+                f"<td class='asr-cnt asr-running'>{lib_row['running']}</td>"
+                f"<td class='asr-cnt asr-done'>{lib_row['done']}</td>"
+                f"<td class='asr-cnt asr-failed'>{lib_row['failed']}</td>"
                 f"<td><span class='bulk-asr-status' "
                 f"data-lib-id='{lib_row['id']}'></span></td>"
                 f"</tr>"
-                for lib_row in libs
+                for lib_row in asr_state["libraries"]
             )
             bulk_html = (
                 "<h3>Bulk: whole library</h3>"
@@ -1593,8 +1676,15 @@ scanned automatically</strong> as soon as you add them.</p>
                 "episode in the library that doesn't already have an "
                 "auto-generated subtitle. Items with existing ASR are skipped — "
                 "use the per-row Regenerate button on a watch page if you "
-                "want to redo one.</p>"
-                "<table class='admin'><tbody>"
+                "want to redo one. <strong>This page auto-refreshes</strong> — "
+                "you can close it and reopen it during a long run; the live "
+                "counts will pick up where you left off.</p>"
+                f"{_worker_html(asr_state)}"
+                "<table class='admin'><thead><tr>"
+                "<th>library</th><th></th>"
+                "<th>queued</th><th>running</th><th>done</th><th>failed</th>"
+                "<th></th>"
+                "</tr></thead><tbody>"
                 f"{rows}</tbody></table>"
                 f"{_BULK_ASR_JS}"
             )
@@ -2709,6 +2799,15 @@ body.watch .theater-meta h2 { margin-top: 0; }
 .bulk-asr-status.running .asr-text { color: #6cf; font-weight: 500; }
 .bulk-asr-status.done    .asr-text { color: #6c6; font-weight: 500; }
 .bulk-asr-status.failed  .asr-text { color: #f66; font-weight: 500; }
+.asr-worker { background: #181818; border: 1px solid #333; border-radius: 4px;
+               padding: .75rem 1rem; margin: .5rem 0 1rem; line-height: 1.4; }
+.asr-worker.idle { color: #888; }
+.asr-worker.running { color: #eee; }
+.asr-worker .asr-current-title { color: #6cf; font-weight: 500; }
+.asr-cnt { font-variant-numeric: tabular-nums; text-align: right; min-width: 3em; }
+td.asr-cnt.asr-running { color: #6cf; font-weight: 500; }
+td.asr-cnt.asr-done    { color: #6c6; }
+td.asr-cnt.asr-failed  { color: #f66; }
 .asr-spinner { display: inline-block; width: 14px; height: 14px;
                 border: 2px solid currentColor; border-top-color: transparent;
                 border-radius: 50%; animation: asr-spin 0.8s linear infinite;
@@ -3154,34 +3253,92 @@ def _generate_subs_button_html(variants: dict, asr_url: str) -> str:
 
 _BULK_ASR_JS = r"""
 <script>(function(){
+  // The page is its own live dashboard. We poll one endpoint
+  // (/api/admin/asr/library-status) and re-render the per-library cells +
+  // the global "what's transcribing right now" indicator. The bulk button
+  // just enqueues; everything else flows through the same renderer the
+  // initial page load used. Refresh at any time = same view.
   var buttons = document.querySelectorAll('button.bulk-asr-btn');
-  if (!buttons.length) return;
+  var workerBox = document.getElementById('asr-worker');
+  if (!buttons.length && !workerBox) return;
 
-  function setStatus(span, state, text, withSpinner) {
+  function escHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function renderWorker(state) {
+    if (!workerBox) return;
+    var cur = state && state.current;
+    workerBox.classList.remove('idle', 'running');
+    if (cur) {
+      workerBox.classList.add('running');
+      var libPart = cur.library_name
+        ? ' <span class="kind">(library: ' + escHtml(cur.library_name) + ')</span>'
+        : '';
+      workerBox.innerHTML =
+        '<span class="asr-spinner" aria-hidden="true"></span> ' +
+        '<strong>Worker is transcribing:</strong> ' +
+        '<span class="asr-current-title">' + escHtml(cur.title) + '</span>' +
+        libPart;
+    } else {
+      workerBox.classList.add('idle');
+      workerBox.innerHTML =
+        '<strong>Worker is idle.</strong> No ASR job is currently running.';
+    }
+  }
+
+  function renderLibraries(state) {
+    (state.libraries || []).forEach(function(lib) {
+      var row = document.querySelector('tr[data-lib-id="' + lib.id + '"]');
+      if (!row) return;
+      var cells = {
+        queued: row.querySelector('.asr-queued'),
+        running: row.querySelector('.asr-running'),
+        done: row.querySelector('.asr-done'),
+        failed: row.querySelector('.asr-failed'),
+      };
+      Object.keys(cells).forEach(function(k) {
+        if (cells[k]) cells[k].textContent = String(lib[k] || 0);
+      });
+      // Re-enable the button if this library has no in-flight work.
+      var btn = row.querySelector('button.bulk-asr-btn');
+      var inflight = (lib.queued || 0) + (lib.running || 0);
+      if (btn && inflight === 0) btn.disabled = false;
+    });
+  }
+
+  function setLibStatusMsg(libId, state, text, spin) {
+    var span = document.querySelector(
+      '.bulk-asr-status[data-lib-id="' + libId + '"]'
+    );
+    if (!span) return;
     span.classList.remove('idle', 'working', 'running', 'done', 'failed');
     span.classList.add(state);
-    var spinner = withSpinner
+    var spinner = spin
       ? '<span class="asr-spinner" aria-hidden="true"></span> '
       : '';
     span.innerHTML = spinner + '<span class="asr-text">' + text + '</span>';
   }
 
-  function reenable(libId) {
-    var btn = document.querySelector(
-      'button.bulk-asr-btn[data-lib-id="' + libId + '"]'
-    );
-    if (btn) btn.disabled = false;
+  function refresh() {
+    fetch('/api/admin/asr/library-status', { credentials: 'same-origin' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(state) {
+        if (!state) return;
+        renderWorker(state);
+        renderLibraries(state);
+      })
+      .catch(function() { /* network blip — try again on next tick */ });
   }
 
   buttons.forEach(function(btn) {
     btn.addEventListener('click', function() {
       var libId = btn.dataset.libId;
-      var status = document.querySelector(
-        '.bulk-asr-status[data-lib-id="' + libId + '"]'
-      );
-      if (!status) return;
       btn.disabled = true;
-      setStatus(status, 'working', 'Scanning the library and queuing jobs…', true);
+      setLibStatusMsg(libId, 'working', 'Scanning the library and queuing jobs…', true);
       fetch('/api/admin/asr/library/' + libId, { method: 'POST' })
         .then(function(r) {
           if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -3189,67 +3346,27 @@ _BULK_ASR_JS = r"""
         })
         .then(function(j) {
           if (!j.queued) {
-            setStatus(status, 'done',
+            setLibStatusMsg(libId, 'done',
               'Nothing to queue — every item already has an ASR variant.',
               false);
-            reenable(libId);
+            btn.disabled = false;
             return;
           }
-          setStatus(status, 'running',
-            'Queued ' + j.queued + ' ASR job(s). Worker is processing…',
-            true);
-          // Track *exactly* the IDs we just enqueued so other ASR work
-          // (per-item Generate clicks, previous bulk runs) doesn't skew
-          // the percentage.
-          pollScoped(status, libId, j.job_ids || [], j.queued);
+          setLibStatusMsg(libId, 'running',
+            'Queued ' + j.queued + ' new job(s).', false);
+          refresh();
         })
         .catch(function(e) {
-          setStatus(status, 'failed', 'Queue failed: ' + e.message, false);
-          reenable(libId);
+          setLibStatusMsg(libId, 'failed', 'Queue failed: ' + e.message, false);
+          btn.disabled = false;
         });
     });
   });
 
-  function pollScoped(status, libId, jobIds, total) {
-    if (!jobIds.length) {
-      setStatus(status, 'done', '✓ All ASR jobs done.', false);
-      reenable(libId);
-      return;
-    }
-    var url = '/api/admin/jobs/by-ids?ids=' + encodeURIComponent(jobIds.join(','));
-    fetch(url)
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(s) {
-        if (!s) {
-          setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 5000);
-          return;
-        }
-        var done = (s.done || 0) + (s.failed || 0);
-        var remaining = (s.queued || 0) + (s.running || 0);
-        if (remaining === 0) {
-          if (s.failed > 0) {
-            setStatus(status, 'failed',
-              '✗ ' + s.done + ' of ' + total + ' done, ' + s.failed + ' failed.',
-              false);
-          } else {
-            setStatus(status, 'done',
-              '✓ All ' + total + ' ASR jobs done.', false);
-          }
-          reenable(libId);
-          return;
-        }
-        var pct = total ? Math.round(100 * done / total) : 0;
-        var details = (s.running ? ' (' + s.running + ' running)' : '');
-        setStatus(status, 'running',
-          done + ' / ' + total + ' done (' + pct + '%) — '
-            + remaining + ' remaining' + details,
-          true);
-        setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 3000);
-      })
-      .catch(function() {
-        setTimeout(function() { pollScoped(status, libId, jobIds, total); }, 5000);
-      });
-  }
+  // Always poll, regardless of whether the user clicked a button. That way
+  // a page refresh during a previous bulk run shows the live state too.
+  refresh();
+  setInterval(refresh, 3000);
 })();</script>
 """
 
