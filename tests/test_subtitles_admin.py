@@ -255,10 +255,16 @@ def test_watch_page_shows_generate_button_for_admin_when_no_subtitle(tmp_path):
     r = client.get(f"/watch/{media_id}")
     assert r.status_code == 200
     assert "Generate subtitles via ASR" in r.text
-    # Watch page now uses a JS-driven button + polling, not a form redirect.
+    # Watch page uses a JS-driven button + polling. The button advertises
+    # its target URL via data-asr-url so the inline JS doesn't need any
+    # Python interpolation (which previously emitted invalid braces and
+    # broke the click handler entirely).
     assert "id='gen-subs'" in r.text
-    assert f"/api/admin/asr/{media_id}" in r.text  # POST URL embedded in the inline JS
+    assert f"data-asr-url='/api/admin/asr/{media_id}'" in r.text
     assert "/api/admin/jobs/" in r.text  # polling URL embedded in the inline JS
+    # Make sure the old broken pattern hasn't crept back in: an f-string
+    # with mismatched braces used to render '}}).then' in the rendered JS.
+    assert "}}).then" not in r.text
 
 
 def test_watch_page_hides_generate_button_when_subtitle_present(tmp_path):

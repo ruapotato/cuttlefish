@@ -1739,8 +1739,8 @@ scanned automatically</strong> as soon as you add them.</p>
         admin_actions = ""
         admin_js = ""
         if user and user["is_admin"]:
-            admin_actions = _generate_subs_button_html(variants)
-            admin_js = _generate_subs_js(f"/api/admin/asr/{media_id}")
+            admin_actions = _generate_subs_button_html(variants, f"/api/admin/asr/{media_id}")
+            admin_js = _generate_subs_js()
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1801,8 +1801,8 @@ scanned automatically</strong> as soon as you add them.</p>
         admin_actions = ""
         admin_js = ""
         if user and user["is_admin"]:
-            admin_actions = _generate_subs_button_html(variants)
-            admin_js = _generate_subs_js(f"/api/admin/asr/episode/{episode_id}")
+            admin_actions = _generate_subs_button_html(variants, f"/api/admin/asr/episode/{episode_id}")
+            admin_js = _generate_subs_js()
         strip_html = _episode_strip_html(
             _conn(),
             show_id=row["show_id"],
@@ -2855,10 +2855,12 @@ def _subtitle_tracks_html(base_url: str, variants: dict) -> str:
     return "".join(tracks)
 
 
-def _generate_subs_button_html(variants: dict) -> str:
+def _generate_subs_button_html(variants: dict, asr_url: str) -> str:
     """Admin Generate button + status line. The button label changes
-    based on what's already on disk so the user understands what
-    clicking will do."""
+    based on what's already on disk. The ASR enqueue endpoint URL is
+    passed to the button as a data attribute so the inline JS doesn't
+    have to do string interpolation (which previously corrupted braces
+    inside the JS function body)."""
     has_original = "original" in variants
     has_asr = "asr" in variants
     if has_asr:
@@ -2872,79 +2874,95 @@ def _generate_subs_button_html(variants: dict) -> str:
         hint = "Queues a Parakeet job. We'll auto-reload when it's ready."
     return (
         "<div class='admin-actions'>"
-        f"<button id='gen-subs' type='button'>{label}</button>"
+        f"<button id='gen-subs' type='button' "
+        f"data-asr-url='{html.escape(asr_url)}'>{label}</button>"
         f"<span id='gen-subs-status' class='hint'>{hint}</span>"
         "</div>"
     )
 
 
-def _generate_subs_js(post_url: str) -> str:
-    """Inline ASR-progress JS for the watch page admin button.
+_GEN_SUBS_JS = r"""
+<script>(function(){
+  var btn = document.getElementById('gen-subs');
+  var status = document.getElementById('gen-subs-status');
+  if (!btn || !status) return;
+  var asrUrl = btn.dataset.asrUrl;
+  if (!asrUrl) return;
 
-    Wires the 'Generate' button to POST the job, then polls
-    /api/admin/jobs/{id} every few seconds. The status line shows a
-    spinner + colored text while the job is in flight, plus an
-    indeterminate progress bar while the worker is actually
-    transcribing — so the user always knows something is happening
-    instead of staring at gray hint text.
+  function setStatus(state, text) {
+    status.classList.remove('idle', 'working', 'running', 'done', 'failed');
+    status.classList.add(state);
+    var spinner = (state === 'working' || state === 'running')
+      ? '<span class="asr-spinner" aria-hidden="true"></span> '
+      : '';
+    var bar = (state === 'running')
+      ? '<span class="asr-bar"><span></span></span>'
+      : '';
+    status.innerHTML = spinner + '<span class="asr-text">' + text + '</span>' + bar;
+  }
+
+  btn.addEventListener('click', function() {
+    btn.disabled = true;
+    setStatus('working', 'Queuing job...');
+    fetch(asrUrl, { method: 'POST' })
+      .then(function(r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .then(function(j) {
+        setStatus('working', 'Queued (job #' + j.job_id + '). Waiting for the worker...');
+        poll(j.job_id);
+      })
+      .catch(function(e) {
+        setStatus('failed', 'Queue failed: ' + e.message);
+        btn.disabled = false;
+      });
+  });
+
+  var lastStatus = '';
+  function poll(jid) {
+    fetch('/api/admin/jobs/' + jid)
+      .then(function(r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .then(function(job) {
+        if (job.status !== lastStatus) {
+          lastStatus = job.status;
+          if (job.status === 'queued') {
+            setStatus('working', 'Queued — waiting for the ASR worker to pick it up...');
+          } else if (job.status === 'running') {
+            setStatus('running', 'Transcribing — seconds on GPU, several minutes on CPU.');
+          }
+        }
+        if (job.status === 'done') {
+          setStatus('done', 'Subtitles ready. Reloading...');
+          setTimeout(function() { location.reload(); }, 800);
+          return;
+        }
+        if (job.status === 'failed') {
+          setStatus('failed', 'ASR job failed: ' + (job.error || 'unknown error'));
+          btn.disabled = false;
+          return;
+        }
+        setTimeout(function() { poll(jid); }, 2000);
+      })
+      .catch(function(e) {
+        setStatus('working', 'Polling error: ' + e.message + '; retrying...');
+        setTimeout(function() { poll(jid); }, 4000);
+      });
+  }
+})();</script>
+"""
+
+
+def _generate_subs_js() -> str:
+    """The button reads its target URL from `data-asr-url` so this script
+    needs no Python interpolation — which is what made the previous
+    version silently emit invalid JS like `}}).then(...)` and break
+    the click handler.
     """
-    return (
-        "<script>(function(){"
-        "var btn=document.getElementById('gen-subs');"
-        "var status=document.getElementById('gen-subs-status');"
-        "if(!btn||!status) return;"
-        "function setStatus(state, text){"
-        "  status.classList.remove('idle','working','running','done','failed');"
-        "  status.classList.add(state);"
-        "  var spinner=(state==='working'||state==='running')"
-        "    ?'<span class=\"asr-spinner\" aria-hidden=\"true\"></span> ' : '';"
-        "  var bar=(state==='running')"
-        "    ?'<span class=\"asr-bar\"><span></span></span>' : '';"
-        "  status.innerHTML = spinner + '<span class=\"asr-text\">' + text + '</span>' + bar;"
-        "}"
-        "btn.addEventListener('click',function(){"
-        "  btn.disabled=true;"
-        "  setStatus('working','Queuing job...');"
-        f"  fetch('{post_url}',{{method:'POST'}}).then(function(r){{"
-        "    if(!r.ok){throw new Error('HTTP '+r.status);}"
-        "    return r.json();"
-        "  }}).then(function(j){"
-        "    setStatus('working','Queued (job #'+j.job_id+'). Waiting for the worker...');"
-        "    poll(j.job_id);"
-        "  }).catch(function(e){"
-        "    setStatus('failed','Queue failed: '+e.message);"
-        "    btn.disabled=false;"
-        "  });"
-        "});"
-        "var lastStatus='';"
-        "function poll(jid){"
-        "  fetch('/api/admin/jobs/'+jid).then(function(r){"
-        "    if(!r.ok)throw new Error('HTTP '+r.status);"
-        "    return r.json();"
-        "  }).then(function(job){"
-        "    if(job.status!==lastStatus){"
-        "      lastStatus=job.status;"
-        "      if(job.status==='queued')setStatus('working','Queued — waiting for the ASR worker to pick it up...');"
-        "      else if(job.status==='running')setStatus('running','Transcribing — seconds on GPU, several minutes on CPU.');"
-        "    }"
-        "    if(job.status==='done'){"
-        "      setStatus('done','Subtitles ready. Reloading...');"
-        "      setTimeout(function(){location.reload();},800);"
-        "      return;"
-        "    }"
-        "    if(job.status==='failed'){"
-        "      setStatus('failed','ASR job failed: '+(job.error||'unknown error'));"
-        "      btn.disabled=false;"
-        "      return;"
-        "    }"
-        "    setTimeout(function(){poll(jid);},2000);"
-        "  }).catch(function(e){"
-        "    setStatus('working','Polling error: '+e.message+'; retrying...');"
-        "    setTimeout(function(){poll(jid);},4000);"
-        "  });"
-        "}"
-        "})();</script>"
-    )
+    return _GEN_SUBS_JS
 
 
 def _player_progress_js(progress_url: str) -> str:
