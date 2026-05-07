@@ -210,7 +210,10 @@ def test_library_page_no_poster_renders_placeholder(tmp_path):
     assert "no-poster" in r.text
 
 
-def test_show_page_includes_poster_header(tmp_path):
+def test_show_page_redirects_to_first_episode(tmp_path):
+    """/show/{id} now redirects to the next/first episode (Jellyfin-style),
+    so the show poster lives on the home/library cards rather than on a
+    dedicated show page."""
     root = tmp_path / "tv"
     show = root / "Show"
     s1 = show / "Season 01"
@@ -226,11 +229,11 @@ def test_show_page_includes_poster_header(tmp_path):
         )
     scanner.scan_library(conn, cur.lastrowid, root)
     show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
+    ep_id = conn.execute("SELECT id FROM tv_episodes LIMIT 1").fetchone()["id"]
     client = TestClient(create_app(db_path=db_path))
-    r = client.get(f"/show/{show_id}")
-    assert r.status_code == 200
-    assert "show-poster" in r.text
-    assert f"src='/poster/{show_id}'" in r.text
+    r = client.get(f"/show/{show_id}", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/watch/episode/{ep_id}"
 
 
 # --- duration end-to-end via real scan -------------------------------

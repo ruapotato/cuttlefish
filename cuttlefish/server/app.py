@@ -1768,43 +1768,26 @@ scanned automatically</strong> as soon as you add them.</p>
 
     @app.get("/show/{show_id}", response_class=HTMLResponse)
     def page_show(show_id: int, request: Request):
+        """Selecting a TV show goes straight to the next episode you haven't
+        finished — Jellyfin/Emby behavior. The big episode list now lives
+        as a strip at the bottom of the player page itself."""
         user = _current_user(request)
         conn = _conn()
         show = conn.execute(
-            "SELECT id, title_guess, kind, poster_path FROM media WHERE id = ?", (show_id,)
+            "SELECT id, title_guess, kind FROM media WHERE id = ?", (show_id,)
         ).fetchone()
         if not show or show["kind"] != "tv_show":
             raise HTTPException(404, "show not found")
-        eps = conn.execute(
-            "SELECT id, season, episode, title_guess, duration_seconds FROM tv_episodes "
-            "WHERE show_id = ? ORDER BY season, episode, id",
-            (show_id,),
-        ).fetchall()
+        next_id = _next_episode_for_show(conn, show_id, user["id"] if user else None)
+        if next_id is not None:
+            return RedirectResponse(f"/watch/episode/{next_id}", status_code=303)
+        # No episodes scanned yet — fall back to a small placeholder page.
         title = html.escape(show["title_guess"])
-        poster_html = (
-            f"<img class='show-poster' src='/poster/{show_id}' alt=''>"
-            if show["poster_path"]
-            else ""
+        body = (
+            f"<h2>{title}</h2>"
+            "<p class='empty'>No episodes scanned yet.</p>"
+            "<p><a href='/'>&larr; Libraries</a></p>"
         )
-        if not eps:
-            body = f"{poster_html}<h2>{title}</h2><p class='empty'>No episodes scanned yet.</p>"
-        else:
-            seasons: dict[int, list] = {}
-            for e in eps:
-                seasons.setdefault(e["season"], []).append(e)
-            sections = []
-            for season, items in sorted(seasons.items()):
-                lis = "".join(
-                    f"<li><a href='/watch/episode/{e['id']}'>"
-                    f"S{e['season']:02d}E{e['episode']:02d} &mdash; "
-                    f"{html.escape(e['title_guess'] or '(untitled)')}</a>"
-                    + (f" <span class='kind'>{_format_duration(e['duration_seconds'])}</span>"
-                       if e['duration_seconds'] else "")
-                    + "</li>"
-                    for e in items
-                )
-                sections.append(f"<h3>Season {season}</h3><ul class='episodes'>{lis}</ul>")
-            body = f"{poster_html}<h2>{title}</h2>" + "".join(sections) + "<p><a href='/'>&larr; Libraries</a></p>"
         return _page(title, body, user=user)
 
     @app.get("/watch/episode/{episode_id}", response_class=HTMLResponse)
@@ -1839,6 +1822,13 @@ scanned automatically</strong> as soon as you add them.</p>
                 "</div>"
             )
             admin_js = _generate_subs_js(f"/api/admin/asr/episode/{episode_id}")
+        strip_html = _episode_strip_html(
+            _conn(),
+            show_id=row["show_id"],
+            current_episode_id=episode_id,
+            current_season=row["season"],
+            user_id=user["id"] if user else None,
+        )
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -1849,9 +1839,9 @@ scanned automatically</strong> as soon as you add them.</p>
             f"<div class='theater-meta'>"
             f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
             f"<p>{html.escape(row['title_guess'] or '')}</p>"
-            f"<p><a href='/show/{row['show_id']}'>&larr; All episodes</a></p>"
             f"{admin_actions}"
             "</div>"
+            f"{strip_html}"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
             + admin_js
         )
@@ -2499,6 +2489,44 @@ table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .status-done    { color: #6c6; }
 .status-failed  { color: #f66; }
 .scan-status    { font-size: .9em; }
+/* Episode strip — Jellyfin-style horizontal cards under the player. */
+.episode-strip { max-width: 1400px; margin: 1.5rem auto; padding: 0 1rem; }
+.season-tabs { display: flex; gap: .25rem; margin-bottom: .75rem;
+                border-bottom: 1px solid #333; }
+.season-tabs button { background: none; border: none; padding: .5rem 1rem;
+                       color: #aaa; cursor: pointer; font: inherit;
+                       border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.season-tabs button:hover { color: #eee; }
+.season-tabs button.active { color: #fff; border-bottom-color: #6cf; }
+.ep-cards { display: grid; grid-auto-flow: column;
+             grid-auto-columns: minmax(240px, 1fr);
+             gap: .75rem; overflow-x: auto; padding-bottom: .5rem; }
+.ep-card { display: block; min-width: 240px; max-width: 320px;
+            text-decoration: none; color: inherit; }
+.ep-card .ep-thumb { position: relative; aspect-ratio: 16 / 9;
+                      background: #1a1a1a; border-radius: 4px; overflow: hidden;
+                      border: 2px solid transparent; }
+.ep-card.current .ep-thumb { border-color: #6cf;
+                              box-shadow: 0 0 0 1px #6cf; }
+.ep-card .ep-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ep-card .ep-label { position: absolute; left: .4rem; bottom: .4rem;
+                      background: rgba(0,0,0,.75); color: #eee;
+                      padding: .1rem .4rem; border-radius: 2px;
+                      font-size: .75em; font-weight: bold; letter-spacing: .03em; }
+.ep-card .ep-progress { position: absolute; left: 0; right: 0; bottom: 0;
+                         height: 3px; background: rgba(255,255,255,.15); }
+.ep-card .ep-progress > span { display: block; height: 100%; background: #6cf; }
+.ep-card .ep-watched { position: absolute; right: .4rem; top: .4rem;
+                        background: rgba(0,0,0,.75); color: #6c6;
+                        padding: .1rem .4rem; border-radius: 2px;
+                        font-size: .85em; font-weight: bold; }
+.ep-card.watched .ep-thumb img { opacity: .55; }
+.ep-card .ep-title { display: block; padding: .4rem 0 0; color: #ddd;
+                      font-size: .9em; line-height: 1.25;
+                      overflow: hidden; text-overflow: ellipsis;
+                      display: -webkit-box; -webkit-line-clamp: 2;
+                      -webkit-box-orient: vertical; }
+.ep-card.current .ep-title { color: #fff; }
 ul.cards { list-style: none; padding: 0; display: grid;
             grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 1rem; }
@@ -2545,6 +2573,145 @@ def _progress_actions(item_id: int, kind: str) -> str:
         "<button type='submit'>Reset</button></form>"
     )
     return f"<span class='actions'>{watched} {reset}</span>"
+
+
+def _episode_strip_html(
+    conn, show_id: int, current_episode_id: int,
+    current_season: int, user_id: Optional[int],
+) -> str:
+    """Render the bottom-of-page episode strip with season tabs.
+
+    All seasons are rendered into the HTML; client-side JS shows only the
+    active one. Each card shows the episode's frame thumbnail, S/E label,
+    title, and a watched / in-progress indicator.
+    """
+    eps = conn.execute(
+        "SELECT id, season, episode, title_guess, duration_seconds "
+        "FROM tv_episodes WHERE show_id = ? ORDER BY season, episode, id",
+        (show_id,),
+    ).fetchall()
+    if not eps:
+        return ""
+
+    # Per-user progress map for in-progress / watched indicators
+    progress: dict[int, float] = {}
+    if user_id is not None:
+        for r in conn.execute(
+            "SELECT episode_id, position_seconds, duration_seconds "
+            "FROM episode_progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchall():
+            progress[r["episode_id"]] = r["position_seconds"]
+
+    seasons: dict[int, list] = {}
+    for e in eps:
+        seasons.setdefault(e["season"], []).append(e)
+
+    def render_card(e) -> str:
+        ep_id = e["id"]
+        is_current = ep_id == current_episode_id
+        pos = progress.get(ep_id) or 0
+        dur = e["duration_seconds"] or 0
+        watched = bool(dur) and pos >= 0.9 * dur
+        in_progress = bool(pos) and not watched
+        classes = ["ep-card"]
+        if is_current:
+            classes.append("current")
+        if watched:
+            classes.append("watched")
+        elif in_progress:
+            classes.append("in-progress")
+        progress_overlay = ""
+        if in_progress and dur:
+            pct = max(2, min(100, int(100 * pos / dur)))
+            progress_overlay = (
+                f"<span class='ep-progress'><span style='width:{pct}%'></span></span>"
+            )
+        elif watched:
+            progress_overlay = "<span class='ep-watched'>✓</span>"
+        return (
+            f"<a class='{' '.join(classes)}' href='/watch/episode/{ep_id}'>"
+            f"<div class='ep-thumb'>"
+            f"<img src='/poster/episode/{ep_id}' alt='' loading='lazy' "
+            f"onerror=\"this.style.display='none'\">"
+            f"<span class='ep-label'>S{e['season']:02d}E{e['episode']:02d}</span>"
+            f"{progress_overlay}"
+            f"</div>"
+            f"<span class='ep-title'>{html.escape(e['title_guess'] or '(untitled)')}</span>"
+            f"</a>"
+        )
+
+    season_keys = sorted(seasons.keys())
+    if len(season_keys) > 1:
+        tabs = "".join(
+            f"<button type='button' data-season='{s}' class='{'active' if s == current_season else ''}'>"
+            f"Season {s}</button>"
+            for s in season_keys
+        )
+        tabs_html = f"<div class='season-tabs'>{tabs}</div>"
+    else:
+        tabs_html = ""
+
+    season_blocks = "".join(
+        f"<div class='ep-cards' data-season='{s}'"
+        + ("" if s == current_season else " hidden")
+        + ">"
+        + "".join(render_card(e) for e in seasons[s])
+        + "</div>"
+        for s in season_keys
+    )
+    js = (
+        "<script>(function(){"
+        "var tabs=document.querySelectorAll('.season-tabs button');"
+        "var blocks=document.querySelectorAll('.ep-cards');"
+        "tabs.forEach(function(b){b.addEventListener('click',function(){"
+        "  var s=b.dataset.season;"
+        "  tabs.forEach(function(x){x.classList.toggle('active',x.dataset.season===s);});"
+        "  blocks.forEach(function(x){x.hidden = (x.dataset.season!==s);});"
+        "});});"
+        "var cur=document.querySelector('.ep-card.current');"
+        "if(cur)cur.scrollIntoView({behavior:'instant',block:'nearest',inline:'center'});"
+        "})();</script>"
+    )
+    return (
+        "<div class='episode-strip'>"
+        f"{tabs_html}"
+        f"{season_blocks}"
+        "</div>"
+        f"{js}"
+    )
+
+
+def _next_episode_for_show(conn, show_id: int, user_id: Optional[int]) -> Optional[int]:
+    """Pick the next episode to play for `show_id`. For a logged-in user,
+    that's the first episode that hasn't been watched ≥90% through, in
+    season+episode order. Falls back to the very first episode if all are
+    watched (or the user is anonymous)."""
+    eps = conn.execute(
+        "SELECT id, season, episode, duration_seconds FROM tv_episodes "
+        "WHERE show_id = ? ORDER BY season, episode, id",
+        (show_id,),
+    ).fetchall()
+    if not eps:
+        return None
+    if user_id is None:
+        return eps[0]["id"]
+    progress = {
+        r["episode_id"]: r["position_seconds"]
+        for r in conn.execute(
+            "SELECT episode_id, position_seconds FROM episode_progress "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+    }
+    for ep in eps:
+        pos = progress.get(ep["id"]) or 0
+        dur = ep["duration_seconds"] or 0
+        if dur and pos >= 0.9 * dur:
+            continue  # essentially watched
+        return ep["id"]
+    # All watched — start over with the first.
+    return eps[0]["id"]
 
 
 def _format_duration(seconds: Optional[float]) -> str:
