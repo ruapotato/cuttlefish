@@ -199,3 +199,57 @@ def test_classify_folder_basics(tmp_path: Path):
     assert scanner.classify_folder(show) == "tv_show"
     assert scanner.classify_folder(series) == "audiobook_grouping"
     assert scanner.classify_folder(empty) is None
+
+
+def test_classify_tv_show_with_theme_mp3_at_root(tmp_path: Path):
+    """A TV show folder with a theme.mp3 sitting alongside season dirs is
+    a TV show, not an audiobook. Audio at the top doesn't override video
+    that exists in the tree below."""
+    show = tmp_path / "Some Show"
+    (show / "Season 01").mkdir(parents=True)
+    (show / "Season 02").mkdir(parents=True)
+    _touch(show / "theme.mp3")  # the bait
+    _touch(show / "Season 01" / "Some Show - S01E01.mp4")
+    _touch(show / "Season 01" / "Some Show - S01E02.mp4")
+    _touch(show / "Season 02" / "Some Show - S02E01.mp4")
+    assert scanner.classify_folder(show) == "tv_show"
+
+
+def test_classify_movie_folder_with_theme_mp3(tmp_path: Path):
+    """Direct video files still win — a movie folder with both an mp4 and
+    a theme.mp3 at the same level is a movie."""
+    movie = tmp_path / "Some Movie"
+    movie.mkdir()
+    _touch(movie / "Some Movie.mp4")
+    _touch(movie / "theme.mp3")
+    assert scanner.classify_folder(movie) == "movie"
+
+
+def test_classify_pure_audio_folder_still_audiobook(tmp_path: Path):
+    """No video anywhere + audio = audiobook. Regression check."""
+    book = tmp_path / "Book"
+    book.mkdir()
+    _touch(book / "01.mp3")
+    _touch(book / "02.mp3")
+    _touch(book / "cover.jpg")
+    assert scanner.classify_folder(book) == "audiobook"
+
+
+def test_scan_tv_with_theme_mp3_doesnt_create_audiobook(tmp_path: Path):
+    """End-to-end: a library with one TV show that has a theme.mp3 should
+    produce a single tv_show row in the media table, not an audiobook."""
+    root = tmp_path / "media"
+    root.mkdir()
+    show = root / "My Show"
+    (show / "Season 01").mkdir(parents=True)
+    _touch(show / "theme.mp3")
+    _touch(show / "Season 01" / "My Show - S01E01.mp4")
+    _touch(show / "Season 01" / "My Show - S01E02.mp4")
+
+    conn = _new_db(tmp_path)
+    lib_id = _add_library(conn, "media", root)
+    result = scanner.scan_library(conn, lib_id, root)
+    assert result.shows_added == 1
+    assert result.audiobooks_added == 0
+    kinds = sorted(r["kind"] for r in conn.execute("SELECT kind FROM media").fetchall())
+    assert kinds == ["tv_show"]

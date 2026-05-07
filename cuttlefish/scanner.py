@@ -134,21 +134,30 @@ def classify_folder(folder: Path) -> str | None:
 
     Each subfolder of a library is classified independently, so one library
     can mix movies, TV shows, and audiobooks freely.
+
+    Rule: video anywhere in the tree wins. A folder is only an audiobook if
+    no video file exists below it. This protects against a TV show folder
+    that happens to have a theme.mp3 at its root being misclassified as an
+    audiobook just because audio sits directly inside it.
     """
     videos, audios, subdirs = _direct_children(folder)
-    if audios:
-        return "audiobook"
+
+    # Direct video files = movie folder. Subdirs (if any) are extras.
     if videos:
         return "movie"
-    if not subdirs:
-        return None
-    # Folder contains only other folders. Recurse to find any media at all
-    # below this point. Audio anywhere in the tree → audiobook grouping.
-    has_audio = _tree_has_audio(folder)
-    has_video = _tree_has_video(folder)
-    if has_audio and not has_video:
+
+    # Any video below this folder = it's a TV show (subfolders are seasons),
+    # NOT an audiobook — even if audio files (theme.mp3, etc.) sit at the
+    # top level alongside the season directories.
+    if _tree_has_video(folder):
+        return "tv_show"
+
+    # No video anywhere from here down. Now audio decides.
+    if audios:
+        return "audiobook"
+    if subdirs and _tree_has_audio(folder):
         return "audiobook_grouping"
-    return "tv_show"
+    return None
 
 
 def _tree_has_audio(folder: Path, max_depth: int = 6) -> bool:
