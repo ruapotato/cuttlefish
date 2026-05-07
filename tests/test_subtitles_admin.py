@@ -140,6 +140,105 @@ def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
         asr._worker_in_process = False  # reset for other tests
 
 
+def test_bulk_asr_for_library_queues_everything_without_existing_asr(tmp_path):
+    """Queue ASR for every movie + every episode in a library that doesn't
+    already have a <stem>.asr.srt sitting next to it."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+
+    root = tmp_path / "media"
+    root.mkdir()
+    # 1 loose movie
+    _make_video(root / "Movie A.mp4")
+    # 1 movie that already has an .asr.srt → should be SKIPPED
+    _make_video(root / "Movie B.mp4")
+    (root / "Movie B.asr.srt").write_text("WEBVTT\n")
+    # 1 TV show with 2 episodes (one already has ASR)
+    s1 = root / "Show" / "Season 01"
+    _make_video(s1 / "Show - S01E01.mp4")
+    _make_video(s1 / "Show - S01E02.mp4")
+    (s1 / "Show - S01E02.asr.srt").write_text("WEBVTT\n")
+
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+        lib_id = cur.lastrowid
+    scanner.scan_library(conn, lib_id, root)
+
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+
+    r = client.post(f"/api/admin/asr/library/{lib_id}")
+    assert r.status_code == 200
+    body = r.json()
+    # Movie A (no ASR) + S01E01 (no ASR) = 2; Movie B + S01E02 already have ASR
+    assert body["queued"] == 2
+    # Confirm the actual jobs table.
+    queued = conn.execute(
+        "SELECT COUNT(*) AS c FROM jobs WHERE kind = 'asr' AND status = 'queued'"
+    ).fetchone()["c"]
+    assert queued == 2
+
+
+def test_bulk_asr_form_redirects_with_count(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+
+    root = tmp_path / "media"; root.mkdir()
+    _make_video(root / "Movie.mp4")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+        lib_id = cur.lastrowid
+    scanner.scan_library(conn, lib_id, root)
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    r = client.post(f"/admin/asr/library/{lib_id}", follow_redirects=False)
+    assert r.status_code == 303
+    assert "/admin/subtitles" in r.headers["location"]
+    assert "queued=1" in r.headers["location"]
+
+
+def test_bulk_asr_unknown_library_404(tmp_path):
+    """Bulk enqueue against a library that doesn't exist returns 404."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    from fastapi.testclient import TestClient
+    from cuttlefish.server import create_app
+
+    db_path = tmp_path / "t.db"
+    db.init_schema(db.connect(db_path))
+    client = TestClient(create_app(db_path=db_path))
+    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
+    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
+    r = client.post("/api/admin/asr/library/9999")
+    assert r.status_code == 404
+
+
+def test_admin_subtitles_page_has_bulk_section(tmp_path):
+    if FFMPEG is None:
+        pytest.skip("ffmpeg not installed")
+    client, _, _ = _admin_client_with_movie(tmp_path)
+    r = client.get("/admin/subtitles")
+    assert r.status_code == 200
+    assert "Bulk: whole library" in r.text
+    assert "Generate ASR for everything in this library" in r.text
+
+
 def test_admin_subtitles_shows_pending_count(tmp_path):
     if FFMPEG is None:
         pytest.skip("ffmpeg not installed")

@@ -181,6 +181,110 @@ def test_admin_cruft_page_shows_cruft(tmp_path):
     assert "Delete" in r.text
 
 
+def test_list_cruft_keeps_paired_jpg_in_conservative_mode(tmp_path):
+    """A JPG sitting next to its video is not cruft by default — it might
+    be the user's hand-curated poster."""
+    root = tmp_path / "movies"; root.mkdir()
+    (root / "Movie.mp4").write_bytes(b"")
+    (root / "Movie.jpg").write_bytes(b"")
+    (root / "Movie.srt").write_text("subs")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+    entries = cruft.list_cruft(conn, cur.lastrowid)
+    assert entries == []  # paired sidecars stay
+
+
+def test_list_cruft_flags_paired_jpg_in_aggressive_mode(tmp_path):
+    """With include_sidecar_images=True, paired JPGs become deletable —
+    cuttlefish can re-extract a frame from the video."""
+    root = tmp_path / "movies"; root.mkdir()
+    (root / "Movie.mp4").write_bytes(b"")
+    (root / "Movie.jpg").write_bytes(b"")
+    (root / "Movie.srt").write_text("subs")  # subs always kept
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('m', ?)",
+            (str(root),),
+        )
+    entries = cruft.list_cruft(conn, cur.lastrowid, include_sidecar_images=True)
+    names = sorted(e.path.name for e in entries)
+    assert names == ["Movie.jpg"]
+    assert entries[0].reason.startswith("sidecar-image")
+
+
+def test_bulk_delete_removes_listed_cruft(tmp_path):
+    """Bulk delete: the form posts library_id and the backend re-lists
+    cruft on the server side and deletes each file. Media is never
+    touched."""
+    client, root, db_path = _admin_client(tmp_path)
+    # Plant cruft + a real movie.
+    (root / "downloadedfrom.txt").write_text("x")
+    (root / "info.nfo").write_text("y")
+    real = root / "Real.mp4"
+    assert real.is_file()  # _admin_client created this
+    lib_id = db.connect(db_path).execute("SELECT id FROM libraries").fetchone()["id"]
+    r = client.post(
+        "/admin/cruft/delete-all",
+        data={"library_id": lib_id},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert "deleted=" in r.headers["location"]
+    # Cruft files gone, real movie untouched.
+    assert not (root / "downloadedfrom.txt").exists()
+    assert not (root / "info.nfo").exists()
+    assert real.is_file()
+
+
+def test_bulk_delete_with_include_images_sweeps_jpgs_too(tmp_path):
+    """When include_images=1 is posted, paired JPG sidecars get deleted."""
+    client, root, db_path = _admin_client(tmp_path)
+    # Plant a paired JPG sidecar
+    (root / "Real.jpg").write_bytes(b"\xff\xd8")
+    (root / "stray.txt").write_text("y")
+    lib_id = db.connect(db_path).execute("SELECT id FROM libraries").fetchone()["id"]
+    r = client.post(
+        "/admin/cruft/delete-all",
+        data={"library_id": lib_id, "include_images": "1"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert "include_images=1" in r.headers["location"]
+    assert not (root / "Real.jpg").exists()
+    assert not (root / "stray.txt").exists()
+    # Real video still there
+    assert (root / "Real.mp4").is_file()
+
+
+def test_bulk_delete_404_on_unknown_library(tmp_path):
+    client, _, _ = _admin_client(tmp_path)
+    r = client.post(
+        "/admin/cruft/delete-all",
+        data={"library_id": "9999"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 404
+
+
+def test_admin_cruft_page_has_toggle_and_bulk_button(tmp_path):
+    client, root, _ = _admin_client(tmp_path)
+    (root / "x.txt").write_text("x")
+    r = client.get("/admin/cruft")
+    assert r.status_code == 200
+    # Toggle to switch to aggressive mode
+    assert "include_images" in r.text
+    assert "we can re-extract frames" in r.text
+    # Bulk delete button shows up because there's at least one cruft file
+    assert "Delete all" in r.text
+
+
 def test_admin_cruft_page_form_delete(tmp_path):
     client, root, _ = _admin_client(tmp_path)
     target = root / "downloadedfrom.txt"

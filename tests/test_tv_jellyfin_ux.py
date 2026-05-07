@@ -164,6 +164,142 @@ def test_episode_page_renders_strip_with_all_episodes(tmp_path):
         assert f"/poster/episode/{e['id']}" in r.text
 
 
+def test_specials_folder_stored_under_season_zero(tmp_path):
+    """A folder literally named 'Specials' inside a show goes under
+    season=0 (Plex/Jellyfin convention), not numbered alongside real
+    seasons."""
+    root = tmp_path / "tv"
+    show = root / "Some Show"
+    s1 = show / "Season 01"
+    specials = show / "Specials"
+    s1.mkdir(parents=True)
+    specials.mkdir(parents=True)
+    (s1 / "Some Show - S01E01.mp4").write_bytes(b"")
+    (specials / "Some Show - Special.mp4").write_bytes(b"")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    seasons = sorted(
+        r["season"] for r in conn.execute("SELECT season FROM tv_episodes").fetchall()
+    )
+    assert seasons == [0, 1]
+
+
+@pytest.mark.parametrize("name", [
+    "Extras", "extras", "Bonus", "Bonus Features", "Behind the Scenes",
+    "Deleted Scenes", "Featurettes", "Trailers",
+])
+def test_extras_aliases_all_map_to_season_zero(tmp_path, name):
+    root = tmp_path / "tv"
+    show = root / "Show"
+    extra_dir = show / name
+    s1 = show / "Season 01"
+    s1.mkdir(parents=True)
+    extra_dir.mkdir(parents=True)
+    (s1 / "Show - S01E01.mp4").write_bytes(b"")
+    (extra_dir / "thing.mp4").write_bytes(b"")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    seasons = sorted(
+        r["season"] for r in conn.execute("SELECT season FROM tv_episodes").fetchall()
+    )
+    assert 0 in seasons
+
+
+def test_show_redirect_skips_extras_when_regular_episodes_exist(tmp_path):
+    """Clicking a show shouldn't auto-play a Special when there are real
+    Season 1 episodes still unwatched."""
+    root = tmp_path / "tv"
+    show = root / "Show"
+    s1 = show / "Season 01"
+    extras = show / "Specials"
+    s1.mkdir(parents=True)
+    extras.mkdir(parents=True)
+    (s1 / "Show - S01E01.mp4").write_bytes(b"")
+    (extras / "Show - Special.mp4").write_bytes(b"")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
+    s1e1_id = conn.execute(
+        "SELECT id FROM tv_episodes WHERE season = 1 LIMIT 1"
+    ).fetchone()["id"]
+    client = TestClient(create_app(db_path=db_path))
+    r = client.get(f"/show/{show_id}", follow_redirects=False)
+    assert r.headers["location"] == f"/watch/episode/{s1e1_id}"
+
+
+def test_show_redirect_falls_back_to_extras_if_only_extras(tmp_path):
+    """A show that contains ONLY Specials (no regular seasons) should
+    still play the first extra rather than 404'ing."""
+    root = tmp_path / "tv"
+    show = root / "Show"
+    extras = show / "Specials"
+    extras.mkdir(parents=True)
+    (extras / "Show - Special.mp4").write_bytes(b"")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    show_id = conn.execute("SELECT id FROM media WHERE kind='tv_show'").fetchone()["id"]
+    extras_id = conn.execute("SELECT id FROM tv_episodes").fetchone()["id"]
+    client = TestClient(create_app(db_path=db_path))
+    r = client.get(f"/show/{show_id}", follow_redirects=False)
+    assert r.headers["location"] == f"/watch/episode/{extras_id}"
+
+
+def test_episode_strip_renders_extras_tab_last(tmp_path):
+    """A show with Season 1 + Specials gets two tabs in order: 'Season 1'
+    then 'Extras'."""
+    root = tmp_path / "tv"
+    show = root / "Show"
+    s1 = show / "Season 01"
+    extras = show / "Specials"
+    s1.mkdir(parents=True)
+    extras.mkdir(parents=True)
+    (s1 / "Show - S01E01.mp4").write_bytes(b"")
+    (extras / "Show - X.mp4").write_bytes(b"")
+    db_path = tmp_path / "t.db"
+    conn = db.connect(db_path); db.init_schema(conn)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('tv', ?)",
+            (str(root),),
+        )
+    scanner.scan_library(conn, cur.lastrowid, root)
+    s1e1 = conn.execute(
+        "SELECT id FROM tv_episodes WHERE season = 1 LIMIT 1"
+    ).fetchone()["id"]
+    client = TestClient(create_app(db_path=db_path))
+    r = client.get(f"/watch/episode/{s1e1}")
+    body = r.text
+    # Both labels render in the tabs row.
+    assert "Season 1" in body
+    assert "Extras" in body
+    # And 'Extras' tab comes AFTER 'Season 1' in the source order.
+    assert body.index("Season 1") < body.index("Extras")
+
+
 def test_episode_page_hides_other_seasons_via_hidden_attr_and_css(tmp_path):
     """The non-current season block carries the HTML `hidden` attribute
     AND a matching CSS rule that overrides our explicit display:grid —

@@ -25,7 +25,22 @@ class CruftEntry:
     reason: str  # "orphan-sidecar" or "non-media"
 
 
-def list_cruft(conn: sqlite3.Connection, library_id: int) -> list[CruftEntry]:
+def list_cruft(
+    conn: sqlite3.Connection, library_id: int,
+    include_sidecar_images: bool = False,
+) -> list[CruftEntry]:
+    """List files in the library that the admin might want to delete.
+
+    Default ('conservative'): non-media files (txt/nfo/zip/etc.) and
+    orphan sidecars (subtitle/poster files with no matching media file
+    nearby).
+
+    With include_sidecar_images=True ('aggressive'): also include
+    sidecar IMAGE files (JPG/PNG/WEBP) that sit next to a media file —
+    on the theory that cuttlefish can auto-extract a frame from the
+    video so the hand-bundled poster is redundant. Sidecar SUBTITLES
+    paired with media are still kept under both modes.
+    """
     lib = conn.execute(
         "SELECT root_path FROM libraries WHERE id = ?", (library_id,)
     ).fetchone()
@@ -34,34 +49,42 @@ def list_cruft(conn: sqlite3.Connection, library_id: int) -> list[CruftEntry]:
     root = Path(lib["root_path"])
     if not root.is_dir():
         return []
-    # A library can mix all kinds of media. Both audio and video count as
-    # "media" — anything outside that and the sidecar set is cruft.
     media_exts: frozenset[str] = VIDEO_EXTS | AUDIO_EXTS
 
     out: list[CruftEntry] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        # Skip hidden files / dirs anywhere in the path.
         if any(part.startswith(".") for part in path.relative_to(root).parts):
             continue
         ext = path.suffix.lower()
         if ext in media_exts:
             continue
         if ext in SIDECAR_EXTS:
-            # Sidecar to a media file with the same stem in the same dir?
             siblings = path.parent.iterdir() if path.parent.is_dir() else []
             has_media_sibling = any(
                 s.is_file() and s.stem == path.stem and s.suffix.lower() in media_exts
                 for s in siblings
             )
-            if has_media_sibling:
+            if not has_media_sibling:
+                # Orphan sidecar — always cruft.
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                out.append(CruftEntry(path=path, size_bytes=size, reason="orphan-sidecar"))
                 continue
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = 0
-            out.append(CruftEntry(path=path, size_bytes=size, reason="orphan-sidecar"))
+            # Paired sidecar with a media sibling.
+            if ext in POSTER_EXTS and include_sidecar_images:
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                out.append(CruftEntry(
+                    path=path, size_bytes=size,
+                    reason="sidecar-image (we can extract frames)",
+                ))
+            # Paired subtitles or non-image sidecars with media siblings: keep.
             continue
         try:
             size = path.stat().st_size

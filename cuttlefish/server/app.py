@@ -773,6 +773,60 @@ def create_app(
             )
         return {"ok": True, "job_id": cur.lastrowid}
 
+    def _bulk_enqueue_asr_for_library(conn, library_id: int) -> int:
+        """Queue an ASR job for every movie + episode in the library that
+        doesn't already have an ASR variant on disk. Returns the count
+        enqueued. Idempotent: re-runs after partial completion only enqueue
+        what's still missing."""
+        if conn.execute(
+            "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "library not found")
+        n = 0
+        movies = conn.execute(
+            "SELECT id FROM media WHERE library_id = ? AND kind = 'movie'",
+            (library_id,),
+        ).fetchall()
+        for m in movies:
+            variants = subs_mod.subtitle_variants_for_media(conn, m["id"])
+            if "asr" in variants:
+                continue
+            with conn:
+                conn.execute(
+                    "INSERT INTO jobs (kind, media_id) VALUES ('asr', ?)", (m["id"],)
+                )
+            n += 1
+        eps = conn.execute(
+            "SELECT e.id FROM tv_episodes e "
+            "JOIN media m ON m.id = e.show_id "
+            "WHERE m.library_id = ?",
+            (library_id,),
+        ).fetchall()
+        for e in eps:
+            variants = subs_mod.subtitle_variants_for_episode(conn, e["id"])
+            if "asr" in variants:
+                continue
+            with conn:
+                conn.execute(
+                    "INSERT INTO jobs (kind, episode_id) VALUES ('asr', ?)", (e["id"],)
+                )
+            n += 1
+        return n
+
+    @app.post("/api/admin/asr/library/{library_id}")
+    def api_admin_enqueue_asr_library(library_id: int, request: Request):
+        _require_admin(request)
+        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        return {"ok": True, "queued": n}
+
+    @app.post("/admin/asr/library/{library_id}")
+    def page_admin_enqueue_asr_library(library_id: int, request: Request):
+        _require_admin(request)
+        n = _bulk_enqueue_asr_for_library(_conn(), library_id)
+        return RedirectResponse(
+            f"/admin/subtitles?queued={n}&lib={library_id}", status_code=303,
+        )
+
     @app.get("/api/admin/asr-status")
     def api_admin_asr_status(request: Request):
         _require_admin(request)
@@ -1357,7 +1411,9 @@ scanned automatically</strong> as soon as you add them.</p>
         return RedirectResponse("/admin/jobs", status_code=303)
 
     @app.get("/admin/subtitles", response_class=HTMLResponse)
-    def page_admin_subtitles(request: Request):
+    def page_admin_subtitles(
+        request: Request, queued: Optional[int] = None, lib: Optional[int] = None,
+    ):
         user = _require_admin(request)
         from cuttlefish.workers import asr as _asr
 
@@ -1471,6 +1527,48 @@ scanned automatically</strong> as soon as you add them.</p>
         if not sections:
             sections.append("<p class='empty'>No movies or episodes scanned yet.</p>")
 
+        # Per-library bulk-ASR section. Lists every library with a
+        # 'Generate ASR for everything' button. Idempotent: re-running
+        # only enqueues items that don't already have an ASR variant.
+        libs = conn.execute(
+            "SELECT id, name FROM libraries ORDER BY id"
+        ).fetchall()
+        bulk_html = ""
+        if libs:
+            rows = "".join(
+                f"<tr><td>{html.escape(lib_row['name'])}</td>"
+                f"<td><form method='post' action='/admin/asr/library/{lib_row['id']}' style='display:inline'>"
+                "<button type='submit'>Generate ASR for everything in this library</button>"
+                "</form></td></tr>"
+                for lib_row in libs
+            )
+            bulk_html = (
+                "<h3>Bulk: whole library</h3>"
+                "<p class='hint'>Queues an ASR job for every movie and "
+                "episode in the chosen library that doesn't already have an "
+                "auto-generated subtitle. Items with existing ASR are skipped — "
+                "use the per-row Regenerate button on a watch page if you "
+                "want to redo one.</p>"
+                "<table class='admin'><tbody>"
+                f"{rows}</tbody></table>"
+            )
+
+        # Flash message if we just came back from a bulk-enqueue redirect.
+        flash_html = ""
+        if queued is not None:
+            if queued == 0:
+                flash_html = (
+                    "<p class='hint' style='color:#6c6'>Nothing to queue — "
+                    "every item in that library already has an ASR variant.</p>"
+                )
+            else:
+                flash_html = (
+                    f"<p class='hint' style='color:#6c6'>Queued <strong>{queued}</strong> "
+                    "ASR job(s). The worker is picking them up; check "
+                    "<a href='/admin/jobs'>jobs</a> or refresh this page for the "
+                    "updated 'pending' count.</p>"
+                )
+
         body = (
             "<h2>Subtitles</h2>"
             "<p class='hint'>Click <strong>Generate</strong> to enqueue a "
@@ -1479,6 +1577,8 @@ scanned automatically</strong> as soon as you add them.</p>
             "the watch page picks it up automatically. ASR is slow on CPU — "
             "GPU strongly recommended.</p>"
             f"{status_banner}"
+            f"{flash_html}"
+            f"{bulk_html}"
             + "".join(sections)
             + "<p><a href='/admin'>&larr; Admin</a></p>"
         )
@@ -1505,21 +1605,26 @@ scanned automatically</strong> as soon as you add them.</p>
         return RedirectResponse("/admin/jobs", status_code=303)
 
     @app.get("/admin/cruft", response_class=HTMLResponse)
-    def page_admin_cruft(request: Request):
+    def page_admin_cruft(
+        request: Request, include_images: int = 0, deleted: Optional[int] = None,
+    ):
         user = _require_admin(request)
         conn = _conn()
+        include_imgs = bool(include_images)
         libs = conn.execute("SELECT id, name FROM libraries ORDER BY id").fetchall()
         sections = []
         total = 0
         for lib in libs:
-            entries = cruft_mod.list_cruft(conn, lib["id"])
+            entries = cruft_mod.list_cruft(
+                conn, lib["id"], include_sidecar_images=include_imgs,
+            )
             if not entries:
                 continue
             rows = "".join(
                 f"<tr>"
                 f"<td><code>{html.escape(str(e.path))}</code></td>"
                 f"<td><span class='size'>{_human_size(e.size_bytes)}</span></td>"
-                f"<td>{e.reason}</td>"
+                f"<td>{html.escape(e.reason)}</td>"
                 f"<td><form method='post' action='/admin/cruft/delete' "
                 f"onsubmit='return confirm(\"Delete {html.escape(e.path.name)}?\");'>"
                 f"<input type='hidden' name='path' value='{html.escape(str(e.path))}'>"
@@ -1528,25 +1633,76 @@ scanned automatically</strong> as soon as you add them.</p>
                 for e in entries
             )
             total += len(entries)
+            bulk_form = (
+                f"<form method='post' action='/admin/cruft/delete-all' "
+                f"onsubmit='return confirm(\"Delete ALL {len(entries)} listed file(s) "
+                f"in {html.escape(lib['name'])}? This cannot be undone.\");' "
+                "style='margin-bottom:.5rem'>"
+                f"<input type='hidden' name='library_id' value='{lib['id']}'>"
+                f"<input type='hidden' name='include_images' value='{1 if include_imgs else 0}'>"
+                f"<button type='submit'>Delete all {len(entries)} listed in this library</button>"
+                "</form>"
+            )
             sections.append(
                 f"<h3>{html.escape(lib['name'])}</h3>"
+                f"{bulk_form}"
                 "<table class='admin'><thead><tr>"
                 "<th>path</th><th>size</th><th>reason</th><th></th>"
                 "</tr></thead><tbody>"
                 f"{rows}</tbody></table>"
             )
+
+        # Toggle for include_sidecar_images. Renders as a small form with
+        # a hidden input + submit button so it works without JS.
+        if include_imgs:
+            toggle_html = (
+                "<form method='get' action='/admin/cruft' style='display:inline'>"
+                "<button type='submit'>Hide sidecar images (conservative)</button>"
+                "</form>"
+            )
+            mode_note = (
+                "<strong>Aggressive mode is on:</strong> sidecar JPG/PNG "
+                "images sitting next to videos are listed here too. "
+                "Cuttlefish auto-extracts a frame for the thumbnail so "
+                "those images aren't strictly required."
+            )
+        else:
+            toggle_html = (
+                "<form method='get' action='/admin/cruft' style='display:inline'>"
+                "<input type='hidden' name='include_images' value='1'>"
+                "<button type='submit'>Also list sidecar images "
+                "(we can re-extract frames)</button>"
+                "</form>"
+            )
+            mode_note = (
+                "Conservative mode: only files cuttlefish can't use are "
+                "listed (TXT, NFO, orphan subs). Click the button to also "
+                "surface sidecar JPG/PNG files paired with videos."
+            )
+
+        flash_html = ""
+        if deleted is not None:
+            flash_html = (
+                f"<p class='hint' style='color:#6c6'>Deleted <strong>{deleted}</strong> "
+                "file(s).</p>"
+            )
+
+        intro = (
+            "<h2>Cruft</h2>"
+            f"<p class='hint'>{mode_note}</p>"
+            f"<p>{toggle_html}</p>"
+            f"{flash_html}"
+        )
         if not sections:
             body = (
-                "<h2>Cruft</h2><p class='empty'>No cruft found in any library.</p>"
+                f"{intro}<p class='empty'>Nothing to clean up.</p>"
                 "<p><a href='/admin'>&larr; Admin</a></p>"
             )
         else:
             body = (
-                "<h2>Cruft</h2>"
-                f"<p class='hint'>{total} non-media file(s) found across your libraries. "
-                "These are files cuttlefish does not know what to do with — typically "
-                "<code>downloadedfrom.txt</code>, NFOs, sample files, or orphan "
-                "subtitles whose video disappeared. Delete only what you don't want.</p>"
+                f"{intro}"
+                f"<p class='hint'>{total} file(s) listed across your libraries. "
+                "Delete only what you don't want — there's no undo.</p>"
                 + "".join(sections)
                 + "<p><a href='/admin'>&larr; Admin</a></p>"
             )
@@ -1567,6 +1723,45 @@ scanned automatically</strong> as soon as you add them.</p>
             raise HTTPException(409, "refusing to delete a media file via cruft")
         p.unlink()
         return RedirectResponse("/admin/cruft", status_code=303)
+
+    @app.post("/admin/cruft/delete-all")
+    def page_admin_cruft_delete_all(
+        request: Request,
+        library_id: int = Form(...),
+        include_images: int = Form(0),
+    ):
+        _require_admin(request)
+        conn = _conn()
+        # Re-list at delete time so we don't accept stale paths from the
+        # form. Bulk delete = whatever cruft is currently listed for this
+        # library at the same toggle state.
+        if conn.execute(
+            "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "library not found")
+        from cuttlefish.scanner import AUDIO_EXTS, VIDEO_EXTS
+        entries = cruft_mod.list_cruft(
+            conn, library_id, include_sidecar_images=bool(include_images),
+        )
+        deleted = 0
+        for entry in entries:
+            p = entry.path
+            ext = p.suffix.lower()
+            if ext in VIDEO_EXTS or ext in AUDIO_EXTS:
+                continue  # never delete media
+            if not cruft_mod.is_path_inside_a_library(conn, p):
+                continue
+            try:
+                if p.is_file():
+                    p.unlink()
+                    deleted += 1
+            except OSError:
+                continue
+        # Preserve the include-images toggle on the redirect.
+        qs = f"deleted={deleted}"
+        if include_images:
+            qs += "&include_images=1"
+        return RedirectResponse(f"/admin/cruft?{qs}", status_code=303)
 
     @app.post("/admin/originals/{media_id}/delete")
     def page_admin_delete_original(media_id: int, request: Request):
@@ -1792,7 +1987,10 @@ scanned automatically</strong> as soon as you add them.</p>
         ).fetchone()
         if not row:
             raise HTTPException(404, "episode not found")
-        ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
+        if row["season"] == 0:
+            ep_label = f"Extras E{row['episode']:02d}" if row["episode"] else "Extras"
+        else:
+            ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
         title = f"{row['show_title']} {ep_label}"
         variants = subs_mod.subtitle_variants_for_episode(_conn(), episode_id)
         track_html = _subtitle_tracks_html(
@@ -2612,6 +2810,11 @@ def _episode_strip_html(
     for e in eps:
         seasons.setdefault(e["season"], []).append(e)
 
+    def _card_label(e) -> str:
+        if e["season"] == 0:
+            return f"EXT{e['episode']:02d}" if e["episode"] else "EXT"
+        return f"S{e['season']:02d}E{e['episode']:02d}"
+
     def render_card(e) -> str:
         ep_id = e["id"]
         is_current = ep_id == current_episode_id
@@ -2639,18 +2842,24 @@ def _episode_strip_html(
             f"<div class='ep-thumb'>"
             f"<img src='/poster/episode/{ep_id}' alt='' loading='lazy' "
             f"onerror=\"this.style.display='none'\">"
-            f"<span class='ep-label'>S{e['season']:02d}E{e['episode']:02d}</span>"
+            f"<span class='ep-label'>{_card_label(e)}</span>"
             f"{progress_overlay}"
             f"</div>"
             f"<span class='ep-title'>{html.escape(e['title_guess'] or '(untitled)')}</span>"
             f"</a>"
         )
 
-    season_keys = sorted(seasons.keys())
+    # Sort regular seasons first, extras (season=0) last. So a show with
+    # Season 1, Season 2, Specials renders tabs as: Season 1 | Season 2 | Extras.
+    season_keys = sorted(seasons.keys(), key=lambda s: (s == 0, s))
+
+    def _season_label(s: int) -> str:
+        return "Extras" if s == 0 else f"Season {s}"
+
     if len(season_keys) > 1:
         tabs = "".join(
             f"<button type='button' data-season='{s}' class='{'active' if s == current_season else ''}'>"
-            f"Season {s}</button>"
+            f"{_season_label(s)}</button>"
             for s in season_keys
         )
         tabs_html = f"<div class='season-tabs'>{tabs}</div>"
@@ -2690,17 +2899,24 @@ def _episode_strip_html(
 def _next_episode_for_show(conn, show_id: int, user_id: Optional[int]) -> Optional[int]:
     """Pick the next episode to play for `show_id`. For a logged-in user,
     that's the first episode that hasn't been watched ≥90% through, in
-    season+episode order. Falls back to the very first episode if all are
-    watched (or the user is anonymous)."""
-    eps = conn.execute(
+    season+episode order. Falls back to the first episode if everything
+    is watched (or the user is anonymous).
+
+    Extras (season=0) are skipped when the show has any regular-season
+    episodes — clicking a show shouldn't dump you into a behind-the-scenes
+    reel. If a show has *only* extras, those become the pool.
+    """
+    all_eps = conn.execute(
         "SELECT id, season, episode, duration_seconds FROM tv_episodes "
         "WHERE show_id = ? ORDER BY season, episode, id",
         (show_id,),
     ).fetchall()
-    if not eps:
+    if not all_eps:
         return None
+    regular = [e for e in all_eps if e["season"] != 0]
+    pool = regular if regular else all_eps
     if user_id is None:
-        return eps[0]["id"]
+        return pool[0]["id"]
     progress = {
         r["episode_id"]: r["position_seconds"]
         for r in conn.execute(
@@ -2709,14 +2925,13 @@ def _next_episode_for_show(conn, show_id: int, user_id: Optional[int]) -> Option
             (user_id,),
         ).fetchall()
     }
-    for ep in eps:
+    for ep in pool:
         pos = progress.get(ep["id"]) or 0
         dur = ep["duration_seconds"] or 0
         if dur and pos >= 0.9 * dur:
-            continue  # essentially watched
+            continue
         return ep["id"]
-    # All watched — start over with the first.
-    return eps[0]["id"]
+    return pool[0]["id"]
 
 
 def _format_duration(seconds: Optional[float]) -> str:

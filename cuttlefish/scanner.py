@@ -33,6 +33,14 @@ POSTER_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 _SEASON_DIR = re.compile(r"^(?:s|season)\s*(\d{1,3})$", re.IGNORECASE)
 _EP_MARKER = re.compile(r"s(\d{1,3})e(\d{1,3})", re.IGNORECASE)
 
+# Folder names that should be treated as 'extras' rather than a numbered
+# season. Plex/Jellyfin/Emby convention is to record these under season 0.
+_EXTRAS_DIR_NAMES = frozenset({
+    "specials", "extras", "extra",
+    "behind the scenes", "bonus", "bonus features", "bonuses",
+    "featurettes", "deleted scenes", "trailers", "interviews",
+})
+
 
 @dataclass
 class ScanResult:
@@ -298,7 +306,10 @@ def _add_show(conn: sqlite3.Connection, library_id: int, show_dir: Path,
                             poster_path=poster)
     result.shows_added += 1
     first_episode_video: Path | None = None
-    # Discover seasons
+    # Discover seasons. Folder names that look like extras (Specials,
+    # Extras, Bonus, etc.) are stored under season 0 — same convention as
+    # Plex/Jellyfin/Emby. Anything else that isn't a Season-pattern folder
+    # gets a fallback ascending season number.
     season_entries: list[tuple[int, Path]] = []
     fallback_index = 1
     for sub in _iter_visible(show_dir):
@@ -307,6 +318,8 @@ def _add_show(conn: sqlite3.Connection, library_id: int, show_dir: Path,
         m = _SEASON_DIR.match(sub.name)
         if m:
             season_entries.append((int(m.group(1)), sub))
+        elif sub.name.lower() in _EXTRAS_DIR_NAMES:
+            season_entries.append((0, sub))
         else:
             season_entries.append((fallback_index, sub))
             fallback_index += 1

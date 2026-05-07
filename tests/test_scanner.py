@@ -73,18 +73,17 @@ def test_scan_tv_supports_multiple_season_formats(tmp_path: Path):
     _touch(s01 / "My Show - S01E02 - Second.mp4")
     _touch(s2 / "My Show - S02E01 - Return.mp4")
     _touch(s3 / "ep one.mkv")  # no SxxExx marker — episode_num falls back to 0
-    _touch(show / "specials" / "behind the scenes.mp4")  # treated as another season
+    _touch(show / "specials" / "behind the scenes.mp4")  # → season 0 (Extras)
     conn = _new_db(tmp_path)
     lib_id = _add_library(conn, "test", root)
     result = scanner.scan_library(conn, lib_id, root)
     assert result.shows_added == 1
-    # Every subfolder of a TV show is a season — Season 01 / S2 / Season 3 /
-    # specials. Specials gets a fallback season number.
+    # Season 01 (2 eps) / S2 (1 ep) / Season 3 (1 ep) / specials (1 ep, season=0).
     assert result.episodes_added == 5
     seasons = sorted(
         r["season"] for r in conn.execute("SELECT season FROM tv_episodes").fetchall()
     )
-    assert seasons == [1, 1, 1, 2, 3]  # 'specials' falls back to season 1
+    assert seasons == [0, 1, 1, 2, 3]  # specials → 0 (Extras), not season 1
 
 
 def test_scan_audiobooks_arbitrary_depth(tmp_path: Path):
