@@ -2502,6 +2502,10 @@ table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .ep-cards { display: grid; grid-auto-flow: column;
              grid-auto-columns: minmax(240px, 1fr);
              gap: .75rem; overflow-x: auto; padding-bottom: .5rem; }
+/* The HTML `hidden` attribute is normally `display: none` via the UA
+   sheet, but our explicit `display: grid` above outranks the UA rule.
+   Re-assert it at our specificity so season tabs actually filter. */
+.ep-cards[hidden] { display: none; }
 .ep-card { display: block; min-width: 240px; max-width: 320px;
             text-decoration: none; color: inherit; }
 .ep-card .ep-thumb { position: relative; aspect-ratio: 16 / 9;

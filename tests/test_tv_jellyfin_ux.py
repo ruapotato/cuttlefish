@@ -164,6 +164,26 @@ def test_episode_page_renders_strip_with_all_episodes(tmp_path):
         assert f"/poster/episode/{e['id']}" in r.text
 
 
+def test_episode_page_hides_other_seasons_via_hidden_attr_and_css(tmp_path):
+    """The non-current season block carries the HTML `hidden` attribute
+    AND a matching CSS rule that overrides our explicit display:grid —
+    otherwise both seasons would render simultaneously."""
+    db_path, conn = _setup_show_with_two_seasons(tmp_path)
+    s2_first = conn.execute(
+        "SELECT id FROM tv_episodes WHERE season=2 ORDER BY episode LIMIT 1"
+    ).fetchone()["id"]
+    client = TestClient(create_app(db_path=db_path))
+    r = client.get(f"/watch/episode/{s2_first}")
+    assert r.status_code == 200
+    # We're on a season-2 episode, so the season-2 block should NOT be hidden
+    # and the season-1 block should be.
+    assert "<div class='ep-cards' data-season='1' hidden>" in r.text
+    assert "<div class='ep-cards' data-season='2'>" in r.text
+    # CSS override that makes [hidden] actually hide despite display:grid
+    assert ".ep-cards[hidden]" in r.text
+    assert "display: none" in r.text
+
+
 def test_episode_strip_marks_current_episode(tmp_path):
     db_path, conn = _setup_show_with_two_seasons(tmp_path)
     eps = conn.execute(
