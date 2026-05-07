@@ -237,6 +237,12 @@ def test_admin_subtitles_page_has_bulk_section(tmp_path):
     assert r.status_code == 200
     assert "Bulk: whole library" in r.text
     assert "Generate ASR for everything in this library" in r.text
+    # JS-driven button + status span (not a form-redirect)
+    assert "class='bulk-asr-btn'" in r.text
+    assert "class='bulk-asr-status'" in r.text
+    assert "data-lib-id=" in r.text
+    # Polling URL referenced from the inline JS
+    assert "/api/admin/asr-status" in r.text
 
 
 def test_admin_subtitles_shows_pending_count(tmp_path):

@@ -1527,30 +1527,37 @@ scanned automatically</strong> as soon as you add them.</p>
         if not sections:
             sections.append("<p class='empty'>No movies or episodes scanned yet.</p>")
 
-        # Per-library bulk-ASR section. Lists every library with a
-        # 'Generate ASR for everything' button. Idempotent: re-running
-        # only enqueues items that don't already have an ASR variant.
+        # Per-library bulk-ASR section. Each library has a JS-driven
+        # button that posts to /api/admin/asr/library/{id} and then polls
+        # /api/admin/asr-status to surface 'N jobs remaining' inline.
+        # Idempotent: re-running only enqueues items that don't already
+        # have an ASR variant.
         libs = conn.execute(
             "SELECT id, name FROM libraries ORDER BY id"
         ).fetchall()
         bulk_html = ""
         if libs:
             rows = "".join(
-                f"<tr><td>{html.escape(lib_row['name'])}</td>"
-                f"<td><form method='post' action='/admin/asr/library/{lib_row['id']}' style='display:inline'>"
-                "<button type='submit'>Generate ASR for everything in this library</button>"
-                "</form></td></tr>"
+                f"<tr>"
+                f"<td>{html.escape(lib_row['name'])}</td>"
+                f"<td><button type='button' class='bulk-asr-btn' "
+                f"data-lib-id='{lib_row['id']}'>"
+                "Generate ASR for everything in this library</button></td>"
+                f"<td><span class='bulk-asr-status' "
+                f"data-lib-id='{lib_row['id']}'></span></td>"
+                f"</tr>"
                 for lib_row in libs
             )
             bulk_html = (
                 "<h3>Bulk: whole library</h3>"
                 "<p class='hint'>Queues an ASR job for every movie and "
-                "episode in the chosen library that doesn't already have an "
+                "episode in the library that doesn't already have an "
                 "auto-generated subtitle. Items with existing ASR are skipped — "
                 "use the per-row Regenerate button on a watch page if you "
                 "want to redo one.</p>"
                 "<table class='admin'><tbody>"
                 f"{rows}</tbody></table>"
+                f"{_BULK_ASR_JS}"
             )
 
         # Flash message if we just came back from a bulk-enqueue redirect.
@@ -2657,6 +2664,12 @@ body.watch .theater-meta h2 { margin-top: 0; }
 #gen-subs-status.running .asr-text  { color: #6cf; font-weight: 500; }
 #gen-subs-status.done    .asr-text  { color: #6c6; font-weight: 500; }
 #gen-subs-status.failed  .asr-text  { color: #f66; font-weight: 500; }
+.bulk-asr-status { display: inline-flex; align-items: center; gap: .5rem;
+                    font-size: .9em; }
+.bulk-asr-status.working .asr-text { color: #fc6; font-weight: 500; }
+.bulk-asr-status.running .asr-text { color: #6cf; font-weight: 500; }
+.bulk-asr-status.done    .asr-text { color: #6c6; font-weight: 500; }
+.bulk-asr-status.failed  .asr-text { color: #f66; font-weight: 500; }
 .asr-spinner { display: inline-block; width: 14px; height: 14px;
                 border: 2px solid currentColor; border-top-color: transparent;
                 border-radius: 50%; animation: asr-spin 0.8s linear infinite;
@@ -3098,6 +3111,88 @@ def _generate_subs_button_html(variants: dict, asr_url: str) -> str:
         f"<span id='gen-subs-status' class='hint'>{hint}</span>"
         "</div>"
     )
+
+
+_BULK_ASR_JS = r"""
+<script>(function(){
+  var buttons = document.querySelectorAll('button.bulk-asr-btn');
+  if (!buttons.length) return;
+
+  function setStatus(span, state, text, withSpinner) {
+    span.classList.remove('idle', 'working', 'running', 'done', 'failed');
+    span.classList.add(state);
+    var spinner = withSpinner
+      ? '<span class="asr-spinner" aria-hidden="true"></span> '
+      : '';
+    span.innerHTML = spinner + '<span class="asr-text">' + text + '</span>';
+  }
+
+  buttons.forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var libId = btn.dataset.libId;
+      var status = document.querySelector(
+        '.bulk-asr-status[data-lib-id="' + libId + '"]'
+      );
+      if (!status) return;
+      btn.disabled = true;
+      setStatus(status, 'working', 'Scanning the library and queuing jobs…', true);
+      fetch('/api/admin/asr/library/' + libId, { method: 'POST' })
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(j) {
+          if (!j.queued) {
+            setStatus(status, 'done',
+              'Nothing to queue — every item already has an ASR variant.',
+              false);
+            btn.disabled = false;
+            return;
+          }
+          setStatus(status, 'running',
+            'Queued ' + j.queued + ' ASR job(s). Worker is processing…',
+            true);
+          pollGlobal(status, j.queued);
+        })
+        .catch(function(e) {
+          setStatus(status, 'failed', 'Queue failed: ' + e.message, false);
+          btn.disabled = false;
+        });
+    });
+  });
+
+  function pollGlobal(status, initial) {
+    fetch('/api/admin/asr-status')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(s) {
+        if (!s) {
+          setTimeout(function() { pollGlobal(status, initial); }, 5000);
+          return;
+        }
+        var pending = (s.queued || 0);
+        if (pending === 0) {
+          setStatus(status, 'done', '✓ All ASR jobs done.', false);
+          // Allow re-running for any items added since.
+          var lid = status.dataset.libId;
+          var btn = document.querySelector(
+            'button.bulk-asr-btn[data-lib-id="' + lid + '"]'
+          );
+          if (btn) btn.disabled = false;
+          return;
+        }
+        var done = Math.max(0, initial - pending);
+        var pct = initial ? Math.round(100 * done / initial) : 0;
+        setStatus(status, 'running',
+          done + ' / ' + initial + ' done (' + pct + '%) — ' + pending + ' remaining',
+          true);
+        setTimeout(function() { pollGlobal(status, initial); }, 3000);
+      })
+      .catch(function() {
+        setTimeout(function() { pollGlobal(status, initial); }, 5000);
+      });
+  }
+})();</script>
+"""
 
 
 _GEN_SUBS_JS = r"""
