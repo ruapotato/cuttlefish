@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from cuttlefish import auth, cruft as cruft_mod, db, subtitles as subs_mod, thumbnails as thumbs_mod
 from cuttlefish.clients.opensubtitles import OpenSubtitles
 from cuttlefish.clients.tmdb import TMDb
+from cuttlefish.server import scan_tracker
 from cuttlefish.server.cast import CastBus
 from cuttlefish.server.streaming import stream_file, video_path_for_media
 from cuttlefish.workers import encoder
@@ -805,7 +806,12 @@ def create_app(
                     "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
                     (body.name, str(root.resolve())),
                 )
-            return {"ok": True, "id": cur.lastrowid}
+            new_id = cur.lastrowid
+            # Start scanning right away so the user doesn't have to click
+            # 'Scan' as a separate step. Progress is visible at
+            # GET /api/admin/scans and on /admin/libraries.
+            scan_tracker.start(new_id, db_path)
+            return {"ok": True, "id": new_id, "scanning": True}
         except sqlite3.IntegrityError as e:
             raise HTTPException(409, f"library name or root already exists: {e}")
 
@@ -828,6 +834,10 @@ def create_app(
         ).fetchone()
         if row is None:
             raise HTTPException(404, "library not found")
+        # Synchronous behavior preserved here for the JSON API: callers
+        # of this endpoint historically expected a count payload back
+        # when it returned. The form-based scan button uses the
+        # background tracker instead so the page doesn't hang.
         result = scn.scan_library(conn, library_id, Path(row["root_path"]))
         return {
             "ok": True,
@@ -873,10 +883,11 @@ def create_app(
             list_html = "<p class='empty'>No libraries yet.</p>"
         else:
             row_html = "".join(
-                f"<tr>"
+                f"<tr data-lib-id='{r['id']}'>"
                 f"<td>{r['id']}</td>"
                 f"<td>{html.escape(r['name'])}</td>"
                 f"<td><code>{html.escape(r['root_path'])}</code></td>"
+                f"<td class='scan-cell'><span class='scan-status hint'>—</span></td>"
                 f"<td>"
                 f"<form method='post' action='/admin/libraries/{r['id']}/scan' style='display:inline'>"
                 f"<button type='submit'>Scan</button></form> "
@@ -889,7 +900,7 @@ def create_app(
             )
             list_html = (
                 "<table class='admin'><thead><tr>"
-                "<th>id</th><th>name</th><th>root</th><th></th>"
+                "<th>id</th><th>name</th><th>root</th><th>scan</th><th></th>"
                 "</tr></thead><tbody>"
                 f"{row_html}</tbody></table>"
                 "<form method='post' action='/admin/libraries/scan-all' style='margin-top:1rem'>"
@@ -899,7 +910,8 @@ def create_app(
 <h2>Libraries</h2>
 <p class='hint'>A library is just a folder. Cuttlefish figures out what each
 subfolder is — a movie, a TV show, an audiobook — by looking at it. One
-library can contain all kinds of media, mixed.</p>
+library can contain all kinds of media, mixed. <strong>New libraries are
+scanned automatically</strong> as soon as you add them.</p>
 {list_html}
 <h3>Add a library</h3>
 <form method='post' action='/admin/libraries' class='auth'>
@@ -908,6 +920,7 @@ library can contain all kinds of media, mixed.</p>
   <button type='submit'>Add</button>
 </form>
 <p><a href='/admin'>&larr; Admin</a></p>
+{_scan_progress_js()}
 """
         return _page("Libraries", body, user=user)
 
@@ -923,18 +936,28 @@ library can contain all kinds of media, mixed.</p>
             raise HTTPException(400, f"root path is not a directory: {root}")
         try:
             with _conn() as conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO libraries (name, root_path) VALUES (?, ?)",
                     (name, str(root.resolve())),
                 )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "library name or root already exists")
+        # Auto-scan the new library in the background. /admin/libraries
+        # polls /api/admin/scans and shows progress in the row.
+        scan_tracker.start(cur.lastrowid, db_path)
         return RedirectResponse("/admin/libraries", status_code=303)
 
     @app.post("/admin/libraries/{library_id}/scan")
     def page_admin_libraries_scan(library_id: int, request: Request):
         _require_admin(request)
-        api_admin_scan_one(library_id, request)
+        # Use the background tracker so the user gets live progress
+        # instead of waiting for a synchronous scan to finish before
+        # the page redirects.
+        if _conn().execute(
+            "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "library not found")
+        scan_tracker.start(library_id, db_path)
         return RedirectResponse("/admin/libraries", status_code=303)
 
     @app.post("/admin/libraries/{library_id}/delete")
@@ -947,8 +970,16 @@ library can contain all kinds of media, mixed.</p>
     @app.post("/admin/libraries/scan-all")
     def page_admin_libraries_scan_all(request: Request):
         _require_admin(request)
-        api_admin_scan_all(request)
+        rows = _conn().execute("SELECT id FROM libraries").fetchall()
+        for r in rows:
+            scan_tracker.start(r["id"], db_path)
         return RedirectResponse("/admin/libraries", status_code=303)
+
+    @app.get("/api/admin/scans")
+    def api_admin_scans(request: Request):
+        """Per-library scan progress for the live UI poller."""
+        _require_admin(request)
+        return scan_tracker.all()
 
     # --- Admin: users -----------------------------------------------------
 
@@ -2467,6 +2498,7 @@ table.admin th { color: #aaa; font-weight: normal; font-size: .85em; }
 .status-running { color: #fc6; }
 .status-done    { color: #6c6; }
 .status-failed  { color: #f66; }
+.scan-status    { font-size: .9em; }
 ul.cards { list-style: none; padding: 0; display: grid;
             grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 1rem; }
@@ -2583,6 +2615,55 @@ def _watch_url(kind: str, media_id: int) -> str:
     if kind == "audiobook":
         return f"/book/{media_id}"
     return f"/watch/{media_id}"
+
+
+def _scan_progress_js() -> str:
+    """Polls /api/admin/scans and updates the per-library status cell."""
+    return (
+        "<script>(function(){"
+        "function fmt(p){"
+        "  if(p.status==='running'){"
+        "    var label='Scanning';"
+        "    if(p.total>0)label+=' '+p.current+' / '+p.total;"
+        "    if(p.current_item)label+=' — '+p.current_item;"
+        "    return label;"
+        "  }"
+        "  if(p.status==='done'){"
+        "    var r=p.result||{};"
+        "    var bits=[];"
+        "    if(r.movies_added)bits.push(r.movies_added+' movie(s)');"
+        "    if(r.shows_added)bits.push(r.shows_added+' show(s)');"
+        "    if(r.episodes_added)bits.push(r.episodes_added+' episode(s)');"
+        "    if(r.audiobooks_added)bits.push(r.audiobooks_added+' audiobook(s)');"
+        "    return 'Done: '+(bits.length?bits.join(', '):'no media found');"
+        "  }"
+        "  if(p.status==='failed')return 'Failed: '+(p.error||'unknown error');"
+        "  return p.status||'';"
+        "}"
+        "function tick(){"
+        "  fetch('/api/admin/scans').then(function(r){"
+        "    if(!r.ok)return null;"
+        "    return r.json();"
+        "  }).then(function(scans){"
+        "    if(!scans)return;"
+        "    var anyRunning=false;"
+        "    document.querySelectorAll('tr[data-lib-id]').forEach(function(tr){"
+        "      var id=tr.dataset.libId;"
+        "      var p=scans[id];"
+        "      var cell=tr.querySelector('.scan-status');"
+        "      if(!cell)return;"
+        "      if(p){"
+        "        cell.textContent=fmt(p);"
+        "        cell.className='scan-status status-'+p.status;"
+        "        if(p.status==='running')anyRunning=true;"
+        "      }"
+        "    });"
+        "    setTimeout(tick, anyRunning?1500:5000);"
+        "  }).catch(function(){setTimeout(tick,5000);});"
+        "}"
+        "tick();"
+        "})();</script>"
+    )
 
 
 def _generate_subs_js(post_url: str) -> str:

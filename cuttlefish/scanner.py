@@ -347,31 +347,46 @@ def _walk_audiobook_grouping(
 
 
 def scan_library(
-    conn: sqlite3.Connection, library_id: int, root: Path,
+    conn: sqlite3.Connection,
+    library_id: int,
+    root: Path,
+    on_progress=None,
 ) -> ScanResult:
-    """Walk the library root, classifying each top-level entry independently."""
+    """Walk the library root, classifying each top-level entry independently.
+
+    on_progress: optional callback(current, total, item_name). Called once
+    with (0, total, "") at the start, after every top-level item processed,
+    and once with (total, total, "") at the end. Used by the web UI's
+    auto-scan progress indicator.
+    """
     if not root.is_dir():
         raise ValueError(f"library root not found or not a directory: {root}")
+    if on_progress is None:
+        on_progress = lambda *a, **kw: None  # noqa: E731
     result = ScanResult()
-    for entry in _iter_visible(root):
+    items = list(_iter_visible(root))
+    total = len(items)
+    on_progress(0, total, "")
+    for i, entry in enumerate(items):
+        on_progress(i, total, entry.name)
         if entry.is_file():
             if is_video(entry):
                 _add_movie(conn, library_id, entry, result)
             else:
                 result.skipped += 1
-            continue
-        if not entry.is_dir():
-            result.skipped += 1
-            continue
-        classification = classify_folder(entry)
-        if classification == "movie":
-            _add_movie(conn, library_id, entry, result)
-        elif classification == "audiobook":
-            _add_audiobook(conn, library_id, entry, result)
-        elif classification == "tv_show":
-            _add_show(conn, library_id, entry, result)
-        elif classification == "audiobook_grouping":
-            _walk_audiobook_grouping(conn, library_id, entry, result)
+        elif entry.is_dir():
+            classification = classify_folder(entry)
+            if classification == "movie":
+                _add_movie(conn, library_id, entry, result)
+            elif classification == "audiobook":
+                _add_audiobook(conn, library_id, entry, result)
+            elif classification == "tv_show":
+                _add_show(conn, library_id, entry, result)
+            elif classification == "audiobook_grouping":
+                _walk_audiobook_grouping(conn, library_id, entry, result)
+            else:
+                result.skipped += 1
         else:
             result.skipped += 1
+    on_progress(total, total, "")
     return result
