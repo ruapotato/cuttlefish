@@ -184,10 +184,17 @@ def transcribe_to_srt(
             "Install with: uv sync --extra asr"
         )
     _force_cpu_if_cuda_broken()
+    import os as _os
     import numpy as np  # type: ignore
     import soundfile as sf  # type: ignore
     import torch  # type: ignore
     import nemo.collections.asr as nemo_asr  # type: ignore
+
+    # A whole movie's audio at once blows past most GPU memory budgets.
+    # Chunk into N-second windows, transcribe each, then concatenate
+    # word-level timestamps with the chunk's offset added back in.
+    chunk_secs = int(_os.environ.get("CUTTLEFISH_ASR_CHUNK_SECS", "30"))
+    sample_rate = 16000  # extract_audio_for_asr writes 16 kHz mono
 
     with tempfile.TemporaryDirectory() as td:
         wav = Path(td) / "audio.wav"
@@ -202,8 +209,8 @@ def transcribe_to_srt(
                     "Could not load the Parakeet model on this GPU because "
                     "the installed PyTorch was built for a newer CUDA "
                     "driver than this machine has. Restart with "
-                    "`CUTTLEFISH_ASR_CPU=1 ./start.sh --asr` (or pass "
-                    "`--asr-cpu` to start.sh) to run on CPU instead."
+                    "`CUTTLEFISH_ASR_CPU=1 ./start.sh` (or pass `--asr-cpu` "
+                    "to start.sh) to run on CPU instead."
                 ) from e
             raise
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -211,21 +218,45 @@ def transcribe_to_srt(
         model.eval()
         log.info("loaded Parakeet on %s; transcribing %s", device, video_path)
 
-        # Load the audio into a NumPy array and pass it directly. This skips
-        # NeMo's Lhotse dataloader path, which spins up subprocess workers
-        # that hang silently when the worker thread is a Python daemon
-        # thread (the embedded --with-asr-worker case).
+        # NumPy-array path skips NeMo's Lhotse dataloader (which spawns
+        # subprocess workers and hangs in a daemon thread).
         audio_data, _sr = sf.read(str(wav))
         if audio_data.ndim > 1:
             audio_data = np.mean(audio_data, axis=-1)
         audio_data = audio_data.astype(np.float32)
+        if _sr and _sr != sample_rate:
+            sample_rate = _sr  # extract_audio_for_asr should have produced 16k
 
-        try:
-            results = model.transcribe([audio_data], timestamps=True)
-        except TypeError:
-            results = model.transcribe([audio_data])
-        words = _extract_words_from_nemo_result(results)
-        cues = words_to_cues(words)
+        chunk_samples = max(int(chunk_secs * sample_rate), sample_rate)
+        total_samples = len(audio_data)
+        n_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
+        log.info(
+            "transcribing %d samples (~%.1fs) in %d chunk(s) of %ds",
+            total_samples, total_samples / sample_rate, n_chunks, chunk_secs,
+        )
+        all_words: list[dict] = []
+        for i in range(n_chunks):
+            start_sample = i * chunk_samples
+            end_sample = min(start_sample + chunk_samples, total_samples)
+            chunk = audio_data[start_sample:end_sample]
+            if len(chunk) < int(0.5 * sample_rate):
+                continue  # skip < 0.5s tail
+            chunk_offset_secs = start_sample / sample_rate
+            try:
+                results = model.transcribe([chunk], timestamps=True)
+            except TypeError:
+                results = model.transcribe([chunk])
+            words = _extract_words_from_nemo_result(results)
+            for w in words:
+                w["start"] = float(w.get("start", 0)) + chunk_offset_secs
+                w["end"] = float(w.get("end", 0)) + chunk_offset_secs
+            all_words.extend(words)
+            # Free GPU memory between chunks so OOM stays unlikely on
+            # long-form content.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        cues = words_to_cues(all_words)
         output_srt.parent.mkdir(parents=True, exist_ok=True)
         output_srt.write_text(cues_to_srt(cues), encoding="utf-8")
     return output_srt

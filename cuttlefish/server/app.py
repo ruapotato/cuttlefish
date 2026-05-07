@@ -68,6 +68,43 @@ def create_app(
     _opensubs = opensubtitles_client
     cast_bus = CastBus()
 
+    # --- Login-required gate --------------------------------------------
+    # All routes other than the public set below require a valid session.
+    # As a practical concession, when the users table is empty the gate is
+    # disabled — this keeps test fixtures (which don't always register an
+    # admin) working, and there's nothing to protect on a fresh DB anyway.
+
+    PUBLIC_PATHS = {"/login", "/health", "/api/docs", "/api/openapi.json"}
+    PUBLIC_PREFIXES = ("/api/auth/",)
+
+    @app.middleware("http")
+    async def require_auth(request: Request, call_next):
+        path = request.url.path
+        # Always-public surfaces
+        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
+            return await call_next(request)
+        # /register is open when there are no users yet (covers fresh
+        # installs that didn't go through bootstrap), admin-only after.
+        # The view itself enforces the latter; the gate just lets the
+        # request through.
+        try:
+            conn = db.connect(db_path)
+            n_users = auth.user_count(conn)
+        except Exception:
+            return await call_next(request)
+        if n_users == 0:
+            return await call_next(request)
+        if path == "/register":
+            return await call_next(request)
+        token = request.cookies.get(auth.SESSION_COOKIE_NAME)
+        if token and auth.lookup_session(conn, token):
+            return await call_next(request)
+        # Not authenticated. JSON for API, redirect to /login for HTML.
+        if path.startswith("/api/") or path.startswith("/stream/") \
+                or path.startswith("/poster/") or path.startswith("/subtitle/"):
+            return JSONResponse({"detail": "login required"}, status_code=401)
+        return RedirectResponse(f"/login?next={path}", status_code=303)
+
     def get_tmdb() -> TMDb:
         nonlocal _tmdb
         if _tmdb is None:
@@ -1882,22 +1919,33 @@ library can contain all kinds of media, mixed.</p>
         return _page(title, body, user=user)
 
     @app.get("/login", response_class=HTMLResponse)
-    def page_login(request: Request):
+    def page_login(request: Request, next: str = "/"):
         user = _current_user(request)
         if user:
-            return RedirectResponse("/", status_code=303)
-        body = """
-        <form method='post' action='/login' class='auth'>
-          <h2>Log in</h2>
-          <label>Username <input name='username' autofocus required></label>
-          <label>Password <input name='password' type='password' required></label>
-          <button type='submit'>Log in</button>
-        </form>"""
+            return RedirectResponse(next or "/", status_code=303)
+        # Landing-page tone: this server is private. Authorized users only.
+        next_safe = next if (next.startswith("/") and not next.startswith("//")) else "/"
+        body = f"""
+<div class='landing'>
+  <h2>Cuttlefish</h2>
+  <p class='warn'><strong>Authorized access only.</strong>
+  This is a private media server. Unauthorized use, distribution of
+  content, or attempts to bypass authentication are prohibited.
+  All access is logged.</p>
+  <form method='post' action='/login' class='auth'>
+    <input type='hidden' name='next' value='{html.escape(next_safe)}'>
+    <label>Username <input name='username' autofocus required></label>
+    <label>Password <input name='password' type='password' required></label>
+    <button type='submit'>Log in</button>
+  </form>
+</div>"""
         return _page("Log in", body, user=None)
 
     @app.post("/login")
     def page_login_submit(
-        username: str = Form(...), password: str = Form(...)
+        username: str = Form(...),
+        password: str = Form(...),
+        next: str = Form("/"),
     ):
         conn = _conn()
         user_id = auth.authenticate(conn, username, password)
@@ -1905,11 +1953,12 @@ library can contain all kinds of media, mixed.</p>
             return _page(
                 "Log in",
                 "<p class='error'>Invalid credentials.</p>"
-                + _login_form_html(),
+                + _login_form_html(next),
                 user=None,
             )
         token, expires = auth.create_session(conn, user_id)
-        resp = RedirectResponse("/", status_code=303)
+        next_safe = next if (next and next.startswith("/") and not next.startswith("//")) else "/"
+        resp = RedirectResponse(next_safe, status_code=303)
         resp.set_cookie(
             auth.SESSION_COOKIE_NAME,
             token,
@@ -2389,6 +2438,10 @@ body.watch .theater video { width: 100%; height: auto; max-height: 90vh;
                              display: block; background: #000; }
 body.watch .theater-meta { max-width: 1400px; margin: 1rem auto; padding: 0 1rem; }
 body.watch .theater-meta h2 { margin-top: 0; }
+.landing { max-width: 480px; margin: 2rem auto; }
+.landing h2 { margin-top: 0; }
+.landing .warn { background: #2a1a0d; border-left: 4px solid #c93; color: #eee;
+                  padding: .75rem 1rem; border-radius: 3px; line-height: 1.4; }
 .admin-actions { background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
                   padding: .75rem 1rem; margin-top: 1rem; display: flex;
                   align-items: center; gap: 1rem; flex-wrap: wrap; }
@@ -2644,9 +2697,11 @@ def _player_progress_js(progress_url: str) -> str:
     )
 
 
-def _login_form_html() -> str:
-    return """
+def _login_form_html(next_path: str = "/") -> str:
+    next_safe = next_path if (next_path.startswith("/") and not next_path.startswith("//")) else "/"
+    return f"""
     <form method='post' action='/login' class='auth'>
+      <input type='hidden' name='next' value='{html.escape(next_safe)}'>
       <label>Username <input name='username' autofocus required></label>
       <label>Password <input name='password' type='password' required></label>
       <button type='submit'>Log in</button>
