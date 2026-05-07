@@ -19,10 +19,22 @@ import pytest
 from cuttlefish.workers import asr
 
 
+def _torch_importable() -> bool:
+    """Return whether 'import torch' works in this venv. Skip ASR tests if
+    not (e.g. mid-CUDA-swap state where libcudnn.so isn't on disk yet)."""
+    try:
+        import torch  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 @pytest.fixture
 def fake_nemo(monkeypatch):
     """Install fake nemo + torch + soundfile modules so transcribe_to_srt
     can run end-to-end without the actual GPU/ML stack."""
+    if not _torch_importable():
+        pytest.skip("torch not importable in this venv")
     # ---- fake nemo.collections.asr -----------------------------------
     fake_model = MagicMock()
     fake_model.transcribe.return_value = [
@@ -105,6 +117,8 @@ def test_chunk_size_env_var(tmp_path, fake_nemo, monkeypatch):
 
 def test_short_audio_is_one_chunk(tmp_path, monkeypatch):
     """Audio shorter than chunk_secs → one transcribe call, cues unshifted."""
+    if not _torch_importable():
+        pytest.skip("torch not importable in this venv")
     fake_model = MagicMock()
     fake_model.transcribe.return_value = [
         types.SimpleNamespace(

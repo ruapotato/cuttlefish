@@ -235,6 +235,75 @@ def test_classify_pure_audio_folder_still_audiobook(tmp_path: Path):
     assert scanner.classify_folder(book) == "audiobook"
 
 
+def test_rescan_after_classifier_change_updates_kind(tmp_path: Path):
+    """If a previous (buggy) scan classified a folder as 'audiobook' and the
+    next scan classifies it as 'tv_show', the media row's kind must be
+    updated and any orphan audiobook_tracks rows must be deleted."""
+    root = tmp_path / "media"
+    root.mkdir()
+    show = root / "Show"
+    show.mkdir()
+    # Plant an old audiobook-style row + tracks for what's now a TV show.
+    conn = _new_db(tmp_path)
+    lib_id = _add_library(conn, "media", root)
+    with conn:
+        conn.execute(
+            "INSERT INTO media (library_id, kind, source_path, title_guess) "
+            "VALUES (?, 'audiobook', ?, 'Show')",
+            (lib_id, str(show)),
+        )
+        media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
+        conn.execute(
+            "INSERT INTO audiobook_tracks (book_id, order_index, source_path) "
+            "VALUES (?, 0, ?)",
+            (media_id, str(show / "theme.mp3")),
+        )
+    # Now make the folder structure a TV show with the theme on top.
+    (show / "Season 01").mkdir()
+    _touch(show / "theme.mp3")
+    _touch(show / "Season 01" / "Show - S01E01.mp4")
+
+    scanner.scan_library(conn, lib_id, root)
+    row = conn.execute("SELECT kind FROM media WHERE id = ?", (media_id,)).fetchone()
+    assert row["kind"] == "tv_show"
+    # The orphan audiobook track is gone.
+    tracks = conn.execute(
+        "SELECT COUNT(*) AS c FROM audiobook_tracks WHERE book_id = ?", (media_id,)
+    ).fetchone()
+    assert tracks["c"] == 0
+    # And tv_episodes was populated by the rescan.
+    eps = conn.execute(
+        "SELECT COUNT(*) AS c FROM tv_episodes WHERE show_id = ?", (media_id,)
+    ).fetchone()
+    assert eps["c"] == 1
+
+
+def test_rescan_movie_to_tv_show_drops_movie_only_state(tmp_path: Path):
+    """A folder that used to be a single-file movie that's now a TV show
+    (someone added Season subfolders) should reclassify cleanly."""
+    root = tmp_path / "media"
+    root.mkdir()
+    item = root / "Item"
+    item.mkdir()
+    _touch(item / "Item.mp4")
+    conn = _new_db(tmp_path)
+    lib_id = _add_library(conn, "media", root)
+    scanner.scan_library(conn, lib_id, root)
+    media_id = conn.execute("SELECT id FROM media").fetchone()["id"]
+    assert conn.execute(
+        "SELECT kind FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["kind"] == "movie"
+
+    # User reorganizes: removes the loose mp4, adds a Season folder.
+    (item / "Item.mp4").unlink()
+    (item / "Season 01").mkdir()
+    _touch(item / "Season 01" / "Item - S01E01.mp4")
+    scanner.scan_library(conn, lib_id, root)
+    assert conn.execute(
+        "SELECT kind FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["kind"] == "tv_show"
+
+
 def test_scan_tv_with_theme_mp3_doesnt_create_audiobook(tmp_path: Path):
     """End-to-end: a library with one TV show that has a theme.mp3 should
     produce a single tv_show row in the media table, not an audiobook."""

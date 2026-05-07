@@ -202,6 +202,15 @@ def _upsert_media(
     source_path: Path, title: str, *,
     poster_path: Path | None = None, duration_seconds: float | None = None,
 ) -> int:
+    """Insert or update a media row.
+
+    On conflict (same library_id + source_path), `kind` is refreshed to
+    whatever the latest scan decided — so a rescan after a classifier fix
+    actually reclassifies the row. We then drop child rows that don't
+    match the new kind (audiobook_tracks if it's no longer an audiobook,
+    tv_episodes if it's no longer a TV show). encoded_files is left alone
+    on disk — those are physical artifacts the user may still want.
+    """
     with conn:
         conn.execute(
             """
@@ -210,6 +219,7 @@ def _upsert_media(
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(library_id, source_path) DO UPDATE SET
                 last_seen_at     = CURRENT_TIMESTAMP,
+                kind             = excluded.kind,
                 title_guess      = excluded.title_guess,
                 poster_path      = COALESCE(excluded.poster_path, media.poster_path),
                 duration_seconds = COALESCE(excluded.duration_seconds, media.duration_seconds)
@@ -220,10 +230,18 @@ def _upsert_media(
                 duration_seconds,
             ),
         )
-    return conn.execute(
+    media_id = conn.execute(
         "SELECT id FROM media WHERE library_id = ? AND source_path = ?",
         (library_id, str(source_path)),
     ).fetchone()["id"]
+    # Clean up child rows that the new kind no longer owns. Idempotent —
+    # if the kind didn't change, the DELETE matches zero rows.
+    with conn:
+        if kind != "audiobook":
+            conn.execute("DELETE FROM audiobook_tracks WHERE book_id = ?", (media_id,))
+        if kind != "tv_show":
+            conn.execute("DELETE FROM tv_episodes WHERE show_id = ?", (media_id,))
+    return media_id
 
 
 def _add_movie(conn: sqlite3.Connection, library_id: int, source: Path,
