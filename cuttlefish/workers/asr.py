@@ -307,10 +307,12 @@ def _resolve_asr_target(conn, job) -> tuple[Path, Path, str]:
     Returns (video_path, srt_output_path, kind) where kind is 'media' or
     'episode'. Raises RuntimeError on unresolvable jobs.
     """
+    # Import lazily to keep this module light at boot.
+    from cuttlefish import subtitles as _subs
+
     if job["episode_id"]:
         row = conn.execute(
-            "SELECT e.source_path, ee.video_path AS encoded_video, "
-            "       ee.clean_dir AS encoded_dir "
+            "SELECT e.source_path, ee.video_path AS encoded_video "
             "FROM tv_episodes e LEFT JOIN encoded_episodes ee "
             "ON ee.episode_id = e.id WHERE e.id = ?",
             (job["episode_id"],),
@@ -319,15 +321,12 @@ def _resolve_asr_target(conn, job) -> tuple[Path, Path, str]:
             raise RuntimeError(f"episode {job['episode_id']} not found")
         if row["encoded_video"] and Path(row["encoded_video"]).is_file():
             video = Path(row["encoded_video"])
-            srt = Path(row["encoded_dir"]) / (video.stem + ".srt")
         else:
             video = Path(row["source_path"])
-            srt = video.with_suffix(".srt")
-        return video, srt, "episode"
+        return video, _subs.asr_output_path_for(video), "episode"
     if job["media_id"]:
         row = conn.execute(
-            "SELECT m.source_path, e.video_path AS encoded_video, "
-            "       e.clean_dir AS encoded_dir "
+            "SELECT m.source_path, e.video_path AS encoded_video "
             "FROM media m LEFT JOIN encoded_files e ON e.media_id = m.id "
             "WHERE m.id = ?",
             (job["media_id"],),
@@ -336,15 +335,14 @@ def _resolve_asr_target(conn, job) -> tuple[Path, Path, str]:
             raise RuntimeError(f"media {job['media_id']} not found")
         if row["encoded_video"] and Path(row["encoded_video"]).is_file():
             video = Path(row["encoded_video"])
-            srt = Path(row["encoded_dir"]) / (video.stem + ".srt")
-            return video, srt, "media"
+            return video, _subs.asr_output_path_for(video), "media"
         src = Path(row["source_path"])
         if src.is_file():
-            return src, src.with_suffix(".srt"), "media"
+            return src, _subs.asr_output_path_for(src), "media"
         if src.is_dir():
             for child in sorted(src.iterdir()):
                 if child.is_file() and child.suffix.lower() in VIDEO_EXTS:
-                    return child, child.with_suffix(".srt"), "media"
+                    return child, _subs.asr_output_path_for(child), "media"
             raise RuntimeError(f"no video file inside {src}")
         raise RuntimeError(f"source {src} is neither file nor dir")
     raise RuntimeError("ASR job has neither media_id nor episode_id")
@@ -376,22 +374,11 @@ def run_worker(
         try:
             video, srt, kind = _resolve_asr_target(conn, job)
             transcribe_to_srt(video, srt, ffmpeg=ffmpeg)
-            # Reflect the new sidecar in the encoded_* tables when present
-            # so subtitle_for_media() / subtitle_for_episode() find it via
-            # the column lookup as well as the disk fallback.
-            with conn:
-                if kind == "episode":
-                    conn.execute(
-                        "UPDATE encoded_episodes SET subtitle_path = ? "
-                        "WHERE episode_id = ?",
-                        (str(srt), job["episode_id"]),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE encoded_files SET subtitle_path = ? "
-                        "WHERE media_id = ?",
-                        (str(srt), job["media_id"]),
-                    )
+            # Don't write to encoded_*.subtitle_path — that column tracks
+            # the *original* sidecar (set by the scanner). The ASR variant
+            # lives at <stem>.asr.srt and is found by filesystem lookup
+            # in subs_mod.subtitle_variants_for_*. Tracking it here would
+            # let it shadow / clobber the user's original subtitle.
             encoder.mark_done(conn, job["id"], {"srt": str(srt)})
             processed += 1
         except Exception as e:

@@ -175,7 +175,9 @@ def test_resolve_asr_target_for_loose_movie(tmp_path):
                        (cur.lastrowid,)).fetchone()
     video, srt, kind = asr._resolve_asr_target(conn, job)
     assert video.name == "Tiny.mp4"
-    assert srt.name == "Tiny.srt"
+    # ASR writes to <stem>.asr.srt so it sits alongside any original
+    # sidecar instead of clobbering it.
+    assert srt.name == "Tiny.asr.srt"
     assert srt.parent == root
     assert kind == "media"
 
@@ -203,7 +205,7 @@ def test_resolve_asr_target_for_episode(tmp_path):
                        (cur.lastrowid,)).fetchone()
     video, srt, kind = asr._resolve_asr_target(conn, job)
     assert video.name == "S01E01.mp4"
-    assert srt.name == "S01E01.srt"
+    assert srt.name == "S01E01.asr.srt"
     assert srt.parent == s1
     assert kind == "episode"
 

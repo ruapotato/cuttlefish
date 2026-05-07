@@ -231,15 +231,18 @@ def create_app(
         return PlainTextResponse(text, media_type="text/vtt")
 
     @app.get("/subtitle/{media_id}")
-    def subtitle_for_media(media_id: int):
-        sub = subs_mod.subtitle_for_media(_conn(), media_id)
+    def subtitle_for_media(media_id: int, variant: Optional[str] = None):
+        """variant=None picks the best (ASR if present, else original);
+        variant='asr' / 'original' picks specifically.
+        """
+        sub = subs_mod.subtitle_for_media(_conn(), media_id, variant=variant)
         if sub is None:
             raise HTTPException(404, "no subtitle available for this media")
         return _serve_vtt(sub)
 
     @app.get("/subtitle/episode/{episode_id}")
-    def subtitle_for_episode(episode_id: int):
-        sub = subs_mod.subtitle_for_episode(_conn(), episode_id)
+    def subtitle_for_episode(episode_id: int, variant: Optional[str] = None):
+        sub = subs_mod.subtitle_for_episode(_conn(), episode_id, variant=variant)
         if sub is None:
             raise HTTPException(404, "no subtitle available for this episode")
         return _serve_vtt(sub)
@@ -1729,25 +1732,14 @@ scanned automatically</strong> as soon as you add them.</p>
         if row["kind"] == "audiobook":
             return RedirectResponse(f"/book/{media_id}", status_code=303)
         title = html.escape(row["title_guess"])
-        has_subtitle = subs_mod.subtitle_for_media(_conn(), media_id) is not None
-        track_html = (
-            f"<track kind='subtitles' label='Subtitles' srclang='en' "
-            f"src='/subtitle/{media_id}' default>"
-            if has_subtitle
-            else ""
+        variants = subs_mod.subtitle_variants_for_media(_conn(), media_id)
+        track_html = _subtitle_tracks_html(
+            f"/subtitle/{media_id}", variants
         )
         admin_actions = ""
         admin_js = ""
-        if user and user["is_admin"] and not has_subtitle:
-            admin_actions = (
-                "<div class='admin-actions'>"
-                "<button id='gen-subs' type='button'>Generate subtitles via ASR</button>"
-                "<span id='gen-subs-status' class='hint'>"
-                "Queues a Parakeet job. We'll show progress here and reload "
-                "automatically when subtitles are ready."
-                "</span>"
-                "</div>"
-            )
+        if user and user["is_admin"]:
+            admin_actions = _generate_subs_button_html(variants)
             admin_js = _generate_subs_js(f"/api/admin/asr/{media_id}")
         body = (
             f"<div class='theater'>"
@@ -1802,25 +1794,14 @@ scanned automatically</strong> as soon as you add them.</p>
             raise HTTPException(404, "episode not found")
         ep_label = f"S{row['season']:02d}E{row['episode']:02d}"
         title = f"{row['show_title']} {ep_label}"
-        has_subtitle = subs_mod.subtitle_for_episode(_conn(), episode_id) is not None
-        track_html = (
-            f"<track kind='subtitles' label='Subtitles' srclang='en' "
-            f"src='/subtitle/episode/{episode_id}' default>"
-            if has_subtitle
-            else ""
+        variants = subs_mod.subtitle_variants_for_episode(_conn(), episode_id)
+        track_html = _subtitle_tracks_html(
+            f"/subtitle/episode/{episode_id}", variants
         )
         admin_actions = ""
         admin_js = ""
-        if user and user["is_admin"] and not has_subtitle:
-            admin_actions = (
-                "<div class='admin-actions'>"
-                "<button id='gen-subs' type='button'>Generate subtitles via ASR</button>"
-                "<span id='gen-subs-status' class='hint'>"
-                "Queues a Parakeet job. We'll show progress here and reload "
-                "automatically when subtitles are ready."
-                "</span>"
-                "</div>"
-            )
+        if user and user["is_admin"]:
+            admin_actions = _generate_subs_button_html(variants)
             admin_js = _generate_subs_js(f"/api/admin/asr/episode/{episode_id}")
         strip_html = _episode_strip_html(
             _conn(),
@@ -2830,6 +2811,50 @@ def _scan_progress_js() -> str:
         "}"
         "tick();"
         "})();</script>"
+    )
+
+
+def _subtitle_tracks_html(base_url: str, variants: dict) -> str:
+    """Render one <track> per available subtitle variant. ASR is marked
+    `default` when present so newly-generated tracks auto-load on the
+    next page render — matching the user's request to default to the
+    new ones once they exist."""
+    tracks: list[str] = []
+    has_asr = "asr" in variants
+    if "original" in variants:
+        default_attr = "" if has_asr else " default"
+        tracks.append(
+            f"<track kind='subtitles' label='Original' srclang='en' "
+            f"src='{base_url}?variant=original'{default_attr}>"
+        )
+    if has_asr:
+        tracks.append(
+            f"<track kind='subtitles' label='Auto-generated (ASR)' "
+            f"srclang='en' src='{base_url}?variant=asr' default>"
+        )
+    return "".join(tracks)
+
+
+def _generate_subs_button_html(variants: dict) -> str:
+    """Admin Generate button + status line. The button label changes
+    based on what's already on disk so the user understands what
+    clicking will do."""
+    has_original = "original" in variants
+    has_asr = "asr" in variants
+    if has_asr:
+        label = "Regenerate ASR subtitles"
+        hint = "Replaces the existing auto-generated track. Originals are kept."
+    elif has_original:
+        label = "Generate ASR subtitles (alongside the existing one)"
+        hint = "Existing subtitles stay put. The new track becomes the default."
+    else:
+        label = "Generate subtitles via ASR"
+        hint = "Queues a Parakeet job. We'll auto-reload when it's ready."
+    return (
+        "<div class='admin-actions'>"
+        f"<button id='gen-subs' type='button'>{label}</button>"
+        f"<span id='gen-subs-status' class='hint'>{hint}</span>"
+        "</div>"
     )
 
 
