@@ -2450,7 +2450,27 @@ body.watch .theater-meta h2 { margin-top: 0; }
 .admin-actions form { margin: 0; }
 .admin-actions button { padding: .4rem .8rem; background: #245; color: #eee;
                          border: 1px solid #468; border-radius: 3px; cursor: pointer; font: inherit; }
+.admin-actions button:disabled { opacity: .55; cursor: not-allowed; }
 .admin-actions .hint { color: #888; font-size: .9em; }
+/* ASR job status: spinner + bar + colored text */
+#gen-subs-status { display: inline-flex; align-items: center; gap: .5rem;
+                    flex-wrap: wrap; min-width: 12rem; }
+#gen-subs-status.working .asr-text  { color: #fc6; font-weight: 500; }
+#gen-subs-status.running .asr-text  { color: #6cf; font-weight: 500; }
+#gen-subs-status.done    .asr-text  { color: #6c6; font-weight: 500; }
+#gen-subs-status.failed  .asr-text  { color: #f66; font-weight: 500; }
+.asr-spinner { display: inline-block; width: 14px; height: 14px;
+                border: 2px solid currentColor; border-top-color: transparent;
+                border-radius: 50%; animation: asr-spin 0.8s linear infinite;
+                vertical-align: -2px; }
+@keyframes asr-spin { to { transform: rotate(360deg); } }
+.asr-bar { display: inline-block; flex: 1 0 8rem; height: 6px;
+            background: #222; border-radius: 3px; overflow: hidden;
+            position: relative; }
+.asr-bar > span { position: absolute; left: -40%; top: 0; bottom: 0; width: 40%;
+                   background: linear-gradient(90deg, transparent, #6cf, transparent);
+                   animation: asr-slide 1.4s ease-in-out infinite; }
+@keyframes asr-slide { from { left: -40%; } to { left: 100%; } }
 .empty, .hint { color: #888; }
 .error { color: #f66; }
 code { background: #222; padding: .15em .4em; border-radius: 3px; }
@@ -2861,27 +2881,38 @@ def _generate_subs_button_html(variants: dict) -> str:
 def _generate_subs_js(post_url: str) -> str:
     """Inline ASR-progress JS for the watch page admin button.
 
-    Wires the 'Generate subtitles via ASR' button to POST the job, then
-    polls /api/admin/jobs/{id} every few seconds and updates a status
-    line in place. When the job's done, reloads the page so the
-    server-rendered <track> shows up and captions become available.
+    Wires the 'Generate' button to POST the job, then polls
+    /api/admin/jobs/{id} every few seconds. The status line shows a
+    spinner + colored text while the job is in flight, plus an
+    indeterminate progress bar while the worker is actually
+    transcribing — so the user always knows something is happening
+    instead of staring at gray hint text.
     """
     return (
         "<script>(function(){"
         "var btn=document.getElementById('gen-subs');"
         "var status=document.getElementById('gen-subs-status');"
         "if(!btn||!status) return;"
+        "function setStatus(state, text){"
+        "  status.classList.remove('idle','working','running','done','failed');"
+        "  status.classList.add(state);"
+        "  var spinner=(state==='working'||state==='running')"
+        "    ?'<span class=\"asr-spinner\" aria-hidden=\"true\"></span> ' : '';"
+        "  var bar=(state==='running')"
+        "    ?'<span class=\"asr-bar\"><span></span></span>' : '';"
+        "  status.innerHTML = spinner + '<span class=\"asr-text\">' + text + '</span>' + bar;"
+        "}"
         "btn.addEventListener('click',function(){"
         "  btn.disabled=true;"
-        "  status.textContent='Queuing job...';"
+        "  setStatus('working','Queuing job...');"
         f"  fetch('{post_url}',{{method:'POST'}}).then(function(r){{"
         "    if(!r.ok){throw new Error('HTTP '+r.status);}"
         "    return r.json();"
         "  }}).then(function(j){"
-        "    status.textContent='Queued (job #'+j.job_id+'). Waiting for worker...';"
+        "    setStatus('working','Queued (job #'+j.job_id+'). Waiting for the worker...');"
         "    poll(j.job_id);"
         "  }).catch(function(e){"
-        "    status.textContent='Queue failed: '+e.message;"
+        "    setStatus('failed','Queue failed: '+e.message);"
         "    btn.disabled=false;"
         "  });"
         "});"
@@ -2893,23 +2924,23 @@ def _generate_subs_js(post_url: str) -> str:
         "  }).then(function(job){"
         "    if(job.status!==lastStatus){"
         "      lastStatus=job.status;"
-        "      if(job.status==='queued')status.textContent='Queued — waiting for the ASR worker to pick it up...';"
-        "      else if(job.status==='running')status.textContent='Transcribing — seconds on GPU, several minutes on CPU.';"
+        "      if(job.status==='queued')setStatus('working','Queued — waiting for the ASR worker to pick it up...');"
+        "      else if(job.status==='running')setStatus('running','Transcribing — seconds on GPU, several minutes on CPU.');"
         "    }"
         "    if(job.status==='done'){"
-        "      status.textContent='Subtitles ready. Reloading...';"
+        "      setStatus('done','Subtitles ready. Reloading...');"
         "      setTimeout(function(){location.reload();},800);"
         "      return;"
         "    }"
         "    if(job.status==='failed'){"
-        "      status.textContent='ASR job failed: '+(job.error||'unknown error');"
+        "      setStatus('failed','ASR job failed: '+(job.error||'unknown error'));"
         "      btn.disabled=false;"
         "      return;"
         "    }"
-        "    setTimeout(function(){poll(jid);},3000);"
+        "    setTimeout(function(){poll(jid);},2000);"
         "  }).catch(function(e){"
-        "    status.textContent='Polling error: '+e.message+'; will retry';"
-        "    setTimeout(function(){poll(jid);},5000);"
+        "    setStatus('working','Polling error: '+e.message+'; retrying...');"
+        "    setTimeout(function(){poll(jid);},4000);"
         "  });"
         "}"
         "})();</script>"
@@ -2948,21 +2979,24 @@ def _player_progress_js(progress_url: str) -> str:
         "  fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},"
         "    body:JSON.stringify({position_seconds:t,duration_seconds:el.duration||null})});"
         "});"
-        # --- Fullscreen: try on first user gesture, and on double-click toggle
+        # --- Fullscreen: trigger only on a user gesture *inside the player*.
+        # Earlier this listened on `document`, which meant clicking the
+        # season tabs or an episode card also went fullscreen. Now we bind
+        # to the .theater container (or fall back to the video element) so
+        # only clicks/taps in the player area count.
         "function fs(){if(document.fullscreenElement)return;"
         "  var f=el.requestFullscreen||el.webkitRequestFullscreen||el.mozRequestFullScreen||el.msRequestFullscreen;"
         "  if(f){try{var p=f.call(el);if(p&&p.catch)p.catch(function(){});}catch(e){}}"
         "  if(el.muted){el.muted=false;}"
         "}"
+        "var theater=el.closest('.theater')||el;"
         "function firstGesture(){"
         "  fs();"
-        "  document.removeEventListener('click',firstGesture,true);"
-        "  document.removeEventListener('keydown',firstGesture,true);"
-        "  document.removeEventListener('touchstart',firstGesture,true);"
+        "  theater.removeEventListener('click',firstGesture,true);"
+        "  theater.removeEventListener('touchstart',firstGesture,true);"
         "}"
-        "document.addEventListener('click',firstGesture,true);"
-        "document.addEventListener('keydown',firstGesture,true);"
-        "document.addEventListener('touchstart',firstGesture,true);"
+        "theater.addEventListener('click',firstGesture,true);"
+        "theater.addEventListener('touchstart',firstGesture,true);"
         "el.addEventListener('dblclick',function(){"
         "  if(document.fullscreenElement){document.exitFullscreen();}else{fs();}"
         "});"
