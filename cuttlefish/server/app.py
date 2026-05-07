@@ -1334,25 +1334,24 @@ library can contain all kinds of media, mixed.</p>
         )
         if not asr_ok:
             status_banner = (
-                "<p class='error'><strong>ASR dependencies aren't installed.</strong> "
-                "Install them with <code>uv sync --extra asr</code> "
-                "(~2 GB of torch + nemo), then restart the server with "
-                "<code>uv run cuttlefish serve --with-worker --with-asr-worker</code>. "
-                "You can still queue jobs below; they'll be processed once a "
+                "<p class='error'><strong>ASR dependencies aren't importable</strong> "
+                "in this venv — that's surprising since they're a required "
+                "core dep. Try <code>uv sync</code> from the project root and "
+                "restart. You can still queue jobs; they'll process once the "
                 f"worker comes online.{pending_note}</p>"
             )
         elif not worker_running:
             status_banner = (
-                "<p class='error'><strong>ASR is installed but no worker is "
-                "running in this server process.</strong> Restart with "
-                "<code>uv run cuttlefish serve --with-worker --with-asr-worker</code>, "
-                "or run <code>uv run cuttlefish asr-worker</code> in a separate "
-                f"terminal — queued jobs will start within a few seconds.{pending_note}</p>"
+                "<p class='error'><strong>ASR worker isn't running in this "
+                "process.</strong> Restart the server normally — the ASR "
+                "worker auto-starts as part of <code>serve</code>. Or run "
+                "<code>uv run cuttlefish asr-worker</code> in a separate "
+                f"terminal — queued jobs will start within seconds.{pending_note}</p>"
             )
         else:
             status_banner = (
                 "<p class='hint' style='color:#6c6'>"
-                "<strong>ASR worker is running in this process.</strong> "
+                "<strong>ASR worker is running.</strong> "
                 f"Queued jobs are picked up within ~5 seconds.{pending_note}</p>"
             )
 

@@ -157,8 +157,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
             args.port = cfg.server.port
         if not args.with_worker:
             args.with_worker = cfg.server.with_worker
-        if not args.with_asr_worker:
-            args.with_asr_worker = cfg.server.with_asr_worker
         if args.ffmpeg == "ffmpeg":
             args.ffmpeg = cfg.server.ffmpeg
         if cfg.libraries:
@@ -203,23 +201,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         t.start()
         print(f"started embedded encode worker (thread={t.name})", file=sys.stderr)
-    if args.with_asr_worker:
-        if not asr.is_available():
-            print(
-                "warning: --with-asr-worker requested but ASR deps are not installed; "
-                "skipping. Install with: uv sync --extra asr",
-                file=sys.stderr,
-            )
-        else:
-            asr.mark_worker_started()
-            t = threading.Thread(
-                target=asr.run_worker,
-                kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},
-                daemon=True,
-                name="asr-worker",
-            )
-            t.start()
-            print(f"started embedded ASR worker (thread={t.name})", file=sys.stderr)
+    # ASR worker is always-on as of cuttlefish 0.0.0+: it's a core part
+    # of the system, not an opt-in. If the deps somehow aren't importable
+    # (broken venv, partial install) we warn and keep going so the rest
+    # of the server still works — but normally this branch is taken.
+    if asr.is_available():
+        asr.mark_worker_started()
+        t = threading.Thread(
+            target=asr.run_worker,
+            kwargs={"db_path": args.db, "poll_interval": 5.0, "ffmpeg": args.ffmpeg},
+            daemon=True,
+            name="asr-worker",
+        )
+        t.start()
+        print(f"started embedded ASR worker (thread={t.name})", file=sys.stderr)
+    else:
+        print(
+            "warning: ASR dependencies (torch + nemo_toolkit) aren't importable; "
+            "subtitle generation will be unavailable until you re-run `uv sync`.",
+            file=sys.stderr,
+        )
 
     # TLS provisioning if enabled in config
     ssl_kwargs: dict = {}
@@ -343,8 +344,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     p.add_argument("--with-worker", action="store_true",
                    help="Also run the encode worker in a background thread.")
-    p.add_argument("--with-asr-worker", action="store_true",
-                   help="Also run the ASR worker in a background thread (needs [asr] extra).")
+    # The ASR worker now always starts (deps are required). The flag is
+    # accepted silently for backward compatibility with older invocations.
+    p.add_argument("--with-asr-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary path for embedded workers.")
     p.add_argument("--config", help="Path to a TOML config file (see docs/configuration.md).")
     p.set_defaults(func=cmd_serve)

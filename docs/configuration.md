@@ -15,8 +15,8 @@ db = "/var/lib/cuttlefish/cuttlefish.db"
 host = "0.0.0.0"
 port = 8000
 with_worker = true          # run the encode worker in a background thread
-with_asr_worker = false     # run the Parakeet ASR worker (needs [asr] extra)
 ffmpeg = "ffmpeg"           # path to ffmpeg
+# (the ASR worker now starts automatically — no flag needed)
 
 [[library]]
 name = "Media"
@@ -41,8 +41,8 @@ uv run cuttlefish serve --config /etc/cuttlefish/cuttlefish.toml
    ones, updates existing entries (matched by `name`).
 4. Applies `[server]` defaults that the CLI didn't override.
 5. Starts the embedded encode worker if `with_worker = true`.
-6. Starts the embedded ASR worker if `with_asr_worker = true` and the
-   `[asr]` extra is installed.
+6. Starts the embedded ASR worker (always — it's part of the core
+   system).
 
 ## Environment variables
 

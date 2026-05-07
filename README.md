@@ -59,20 +59,28 @@ cd cuttlefish
 ### 3. Start the server
 
 ```bash
-./start.sh                # base install + encode worker
-./start.sh --asr          # ALSO install [asr] (~2 GB) and run the subtitle worker
+./start.sh
 ```
 
-`start.sh` is a thin wrapper that runs `uv sync`, auto-detects whether
-the optional ASR dependencies are present, and launches `cuttlefish serve`
-with every worker your install supports. Pass any extra flag (`--port`,
-`--host`, `--db`) and it gets forwarded to the server.
+`start.sh` runs `uv sync` (which pulls torch + nemo for the always-on
+ASR pipeline — ~2 GB on first run), auto-detects your CUDA driver and
+swaps in a matching torch wheel if needed, and launches `cuttlefish serve`
+with both the encode and ASR workers active. Pass any extra flag
+(`--port`, `--host`, `--db`) and it gets forwarded to the server.
 
-If you'd rather drive uv yourself, the equivalent two-step is:
+If you'd rather drive uv yourself:
 
 ```bash
-uv sync                                          # or: uv sync --extra asr
-uv run cuttlefish serve --with-worker            # add --with-asr-worker if [asr] is installed
+uv sync
+uv run cuttlefish serve --with-worker
+```
+
+The ASR worker auto-starts as part of `serve`; you don't need a flag
+for it. Want to force CPU-only ASR (no GPU, or skip the CUDA driver
+check)?
+
+```bash
+./start.sh --asr-cpu
 ```
 
 The first time you run either, cuttlefish creates an admin account for you
@@ -257,20 +265,11 @@ The fallback when neither a sidecar SRT nor OpenSubtitles has anything:
 generate captions from the video's audio using
 [NVIDIA Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2).
 
-```bash
-./start.sh --asr
-```
+This is **part of the core install** — `uv sync` (or `./start.sh`)
+pulls torch + nemo automatically, and the ASR worker auto-starts as
+part of `serve`. There's no flag to enable it.
 
-That installs the `[asr]` extras (~2 GB of torch + nemo, one-time) and
-launches the server with both the encode worker and the ASR worker
-running in-process. Equivalent manual steps:
-
-```bash
-uv sync --extra asr
-uv run cuttlefish serve --with-worker --with-asr-worker
-```
-
-Once the server is running, **two web flows** kick off ASR jobs:
+Two web flows kick off ASR jobs:
 
 - **Per-item from the watch page**: open any movie or TV episode that
   doesn't already have subtitles. Below the player, admins see a

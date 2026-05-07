@@ -443,17 +443,15 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "nemo-toolkit", extra = ["asr"] },
+    { name = "numpy" },
     { name = "python-multipart" },
+    { name = "soundfile" },
+    { name = "torch" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.optional-dependencies]
-asr = [
-    { name = "nemo-toolkit", extra = ["asr"] },
-    { name = "numpy" },
-    { name = "soundfile" },
-    { name = "torch" },
-]
 dev = [
     { name = "pytest" },
     { name = "ruff" },
@@ -463,16 +461,16 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "nemo-toolkit", extras = ["asr"], marker = "extra == 'asr'", specifier = ">=1.23" },
-    { name = "numpy", marker = "extra == 'asr'", specifier = ">=1.26" },
+    { name = "nemo-toolkit", extras = ["asr"], specifier = ">=1.23" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
-    { name = "soundfile", marker = "extra == 'asr'", specifier = ">=0.12" },
-    { name = "torch", marker = "extra == 'asr'", specifier = ">=2.2" },
+    { name = "soundfile", specifier = ">=0.12" },
+    { name = "torch", specifier = ">=2.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
-provides-extras = ["asr", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "cycler"

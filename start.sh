@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Starts cuttlefish with every worker that this machine can run.
 #
+# ASR (Parakeet) is now a required core feature, not an optional extra.
+# A fresh install pulls torch + nemo_toolkit (~2 GB). 'serve' always
+# starts the ASR worker.
+#
 # Usage:
-#   ./start.sh                       # base install, ASR worker on if [asr] is installed
-#   ./start.sh --asr                 # also install [asr] (~2 GB), then auto-detect
-#                                    # your CUDA version and install the matching torch
-#                                    # wheel so ASR runs on GPU
-#   ./start.sh --asr --asr-cuda 12.4 # force a specific CUDA version for the torch
-#                                    # wheel (e.g. when nvidia-smi isn't available)
-#   ./start.sh --no-asr-worker       # skip the ASR worker even if available
-#   ./start.sh --asr-cpu             # run ASR on CPU only (slow — for testing)
+#   ./start.sh                          # default: full install, both workers
+#   ./start.sh --asr-cuda 12.4          # force a specific CUDA version for
+#                                       # the torch wheel (e.g. when
+#                                       # nvidia-smi isn't on PATH)
+#   ./start.sh --asr-cpu                # run ASR on CPU only (slow)
 #   ./start.sh --host 0.0.0.0 --port 9000   # forward flags to cuttlefish serve
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -30,8 +31,6 @@ fi
 
 # --- Parse our own flags, forward the rest to cuttlefish ---------------
 
-INSTALL_ASR=false
-SKIP_ASR_WORKER=false
 ASR_CUDA_OVERRIDE=""
 PASSTHROUGH=()
 i=0
@@ -39,12 +38,6 @@ args=("$@")
 while [[ $i -lt ${#args[@]} ]]; do
     arg=${args[$i]}
     case "$arg" in
-        --asr)
-            INSTALL_ASR=true
-            ;;
-        --no-asr-worker)
-            SKIP_ASR_WORKER=true
-            ;;
         --asr-cpu)
             export CUTTLEFISH_ASR_CPU=1
             ;;
@@ -55,6 +48,10 @@ while [[ $i -lt ${#args[@]} ]]; do
         --asr-cuda=*)
             ASR_CUDA_OVERRIDE="${arg#--asr-cuda=}"
             ;;
+        --asr|--no-asr-worker)
+            # Deprecated: ASR is now required and always on. Silently
+            # accept these flags so older scripts/aliases keep working.
+            ;;
         *)
             PASSTHROUGH+=("$arg")
             ;;
@@ -64,13 +61,10 @@ done
 
 # --- Sync deps ----------------------------------------------------------
 
-if $INSTALL_ASR; then
-    echo ">>> Syncing dependencies (with [asr] — first run may take a few minutes)..."
-    uv sync --extra asr
-else
-    echo ">>> Syncing dependencies..."
-    uv sync
-fi
+# ASR is in base dependencies, so 'uv sync' alone pulls torch + nemo.
+# First run downloads ~2 GB and can take a few minutes.
+echo ">>> Syncing dependencies (first run pulls ~2 GB of torch + nemo)..."
+uv sync
 
 # --- Match torch to the local CUDA driver if one is present -------------
 # Parakeet on CPU is slow enough to be unusable, so we go to real lengths
@@ -157,26 +151,15 @@ swap_torch_for_cuda() {
     return 0
 }
 
-if $INSTALL_ASR; then
-    swap_torch_for_cuda
-fi
-
-# --- Decide which worker flags to pass ---------------------------------
-
-WORKER_FLAGS=("--with-worker")
-if ! $SKIP_ASR_WORKER && uv run --no-sync python -c "import nemo.collections.asr" >/dev/null 2>&1; then
-    WORKER_FLAGS+=("--with-asr-worker")
-    echo ">>> ASR dependencies detected — starting with --with-asr-worker."
-else
-    if ! $SKIP_ASR_WORKER; then
-        echo ">>> ASR dependencies not installed; subtitle generation disabled."
-        echo "    Re-run with ./start.sh --asr to install them."
-    fi
-fi
+# Always swap torch to a CUDA-matched wheel — ASR is core so we want
+# the GPU path to work whenever it can.
+swap_torch_for_cuda
 
 # --- Go ----------------------------------------------------------------
 
+# --with-worker turns on the encode worker. The ASR worker auto-starts
+# inside 'serve' (always-on; no flag).
 # --no-sync: 'uv run' would otherwise reconcile the venv against pyproject
 # + uv.lock, which would undo the manual torch wheel swap above.
-echo ">>> uv run --no-sync cuttlefish serve ${WORKER_FLAGS[*]} ${PASSTHROUGH[*]}"
-exec uv run --no-sync cuttlefish serve "${WORKER_FLAGS[@]}" "${PASSTHROUGH[@]}"
+echo ">>> uv run --no-sync cuttlefish serve --with-worker ${PASSTHROUGH[*]}"
+exec uv run --no-sync cuttlefish serve --with-worker "${PASSTHROUGH[@]}"

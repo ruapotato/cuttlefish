@@ -101,10 +101,14 @@ def test_api_asr_status_endpoint(tmp_path):
     r = client.get("/api/admin/asr-status")
     assert r.status_code == 200
     body = r.json()
-    # 'available' is False on the test box (we don't install nemo for tests).
-    # 'worker_in_process' is False because we haven't started one. 'queued'
-    # is 0 because no jobs were enqueued.
-    assert body == {"available": False, "worker_in_process": False, "queued": 0}
+    # 'available' depends on whether nemo is importable in the test env
+    # (it usually is once asr moved to base deps, but CI cache state can
+    # vary). Assert shape only.
+    assert isinstance(body.get("available"), bool)
+    # We never started a worker in this test, so this is always False.
+    assert body["worker_in_process"] is False
+    # No jobs enqueued.
+    assert body["queued"] == 0
 
 
 def test_admin_subtitles_warns_when_worker_not_running(tmp_path, monkeypatch):
@@ -119,8 +123,7 @@ def test_admin_subtitles_warns_when_worker_not_running(tmp_path, monkeypatch):
     asr._worker_in_process = False
     r = client.get("/admin/subtitles")
     assert r.status_code == 200
-    assert "no worker is running" in r.text
-    assert "--with-asr-worker" in r.text
+    assert "ASR worker isn't running" in r.text
 
 
 def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
@@ -132,7 +135,7 @@ def test_admin_subtitles_green_state_when_worker_running(tmp_path, monkeypatch):
     try:
         r = client.get("/admin/subtitles")
         assert r.status_code == 200
-        assert "ASR worker is running in this process" in r.text
+        assert "ASR worker is running" in r.text
     finally:
         asr._worker_in_process = False  # reset for other tests
 
