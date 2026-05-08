@@ -2646,6 +2646,41 @@ scanned automatically</strong> as soon as you add them.</p>
         )
         return _page(title, body, user=user)
 
+    def _neighbor_episodes(conn, episode_id: int) -> tuple:
+        """Return (prev_id, next_id) for the given episode within its show.
+        Either may be None at the boundaries. Ordering is (season, episode):
+        previous skips back across season boundaries (e.g. S02E01 → S01EFin),
+        next skips forward (e.g. S01EFin → S02E01)."""
+        row = conn.execute(
+            "SELECT show_id, season, episode FROM tv_episodes WHERE id = ?",
+            (episode_id,),
+        ).fetchone()
+        if row is None:
+            return None, None
+        show_id = row["show_id"]
+        season = row["season"]
+        episode = row["episode"]
+        prev_row = conn.execute(
+            "SELECT id FROM tv_episodes "
+            "WHERE show_id = ? AND ("
+            "  (season = ? AND episode < ?) OR season < ?"
+            ") "
+            "ORDER BY season DESC, episode DESC LIMIT 1",
+            (show_id, season, episode, season),
+        ).fetchone()
+        next_row = conn.execute(
+            "SELECT id FROM tv_episodes "
+            "WHERE show_id = ? AND ("
+            "  (season = ? AND episode > ?) OR season > ?"
+            ") "
+            "ORDER BY season ASC, episode ASC LIMIT 1",
+            (show_id, season, episode, season),
+        ).fetchone()
+        return (
+            prev_row["id"] if prev_row else None,
+            next_row["id"] if next_row else None,
+        )
+
     @app.get("/watch/episode/{episode_id}", response_class=HTMLResponse)
     def page_watch_episode(episode_id: int, request: Request):
         user = _current_user(request)
@@ -2694,6 +2729,39 @@ scanned automatically</strong> as soon as you add them.</p>
                 "</form>"
             )
 
+        # Prev / Next episode controls + auto-advance on the video's
+        # `ended` event. The progress save-on-timeupdate path naturally
+        # marks the episode as watched (>= 95% threshold) without needing
+        # an explicit watched POST here.
+        prev_id, next_id = _neighbor_episodes(_conn(), episode_id)
+        def _btn(label: str, ep_id) -> str:
+            if ep_id:
+                return (
+                    f"<a class='ep-nav-btn' href='/watch/episode/{ep_id}'>"
+                    f"{label}</a>"
+                )
+            return f"<span class='ep-nav-btn disabled'>{label}</span>"
+        ep_nav_html = (
+            "<div class='ep-nav'>"
+            f"{_btn('&larr; Previous episode', prev_id)}"
+            f"{_btn('Next episode &rarr;', next_id)}"
+            "</div>"
+        )
+        auto_next_js = ""
+        if next_id:
+            auto_next_js = (
+                "<script>(function(){"
+                "var el=document.getElementById('player');if(!el)return;"
+                f"var nu='/watch/episode/{next_id}';"
+                "el.addEventListener('ended',function(){"
+                # Brief pause so the user perceives 'ended → next', not a
+                # jarring instant cut. window.location keeps the URL clean
+                # so the browser back button returns to the previous ep.
+                "  setTimeout(function(){window.location.href=nu;},800);"
+                "});"
+                "})();</script>"
+            )
+
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -2704,11 +2772,13 @@ scanned automatically</strong> as soon as you add them.</p>
             f"<div class='theater-meta'>"
             f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
             f"<p>{html.escape(row['title_guess'] or '')}</p>"
+            f"{ep_nav_html}"
             f"{admin_actions}"
             f"{reset_series_html}"
             "</div>"
             f"{strip_html}"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
+            + auto_next_js
             + admin_js
         )
         return _page(title, body, user=user, body_class="watch")
@@ -3557,6 +3627,16 @@ section.media-section h2 .kind { color: #888; font-size: .7em; font-weight: norm
                        padding: .25rem .65rem; font: inherit;
                        cursor: pointer; font-size: .85em; }
 .reset-series button:hover { color: #f88; border-color: #844; }
+.ep-nav { display: flex; gap: .5rem; margin: .75rem 0;
+           justify-content: space-between; flex-wrap: wrap; }
+.ep-nav-btn { display: inline-block; padding: .4rem .8rem;
+               background: #245; color: #eee;
+               border: 1px solid #468; border-radius: 3px;
+               text-decoration: none; font-size: .9em; cursor: pointer; }
+.ep-nav-btn:hover { background: #356; text-decoration: none; }
+.ep-nav-btn.disabled { background: transparent; color: #555;
+                        border-color: #2a2a2a; cursor: not-allowed; }
+.ep-nav-btn.disabled:hover { background: transparent; }
 .watch-tally { display: flex; gap: 2rem; align-items: center;
                 background: #181818; border: 1px solid #333;
                 border-radius: 4px; padding: 1rem; margin-bottom: 1rem; }
