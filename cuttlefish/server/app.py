@@ -380,6 +380,54 @@ def create_app(
         user = _require_user(request)
         return {"id": user["id"], "username": user["username"], "is_admin": bool(user["is_admin"])}
 
+    @app.get("/api/me/watch-stats")
+    def api_me_watch_stats(request: Request, days: int = 30):
+        """Per-day watch tally for the logged-in user.
+
+        Returns a contiguous list of {day, seconds, minutes} for the last
+        `days` days ending TODAY (server-local), with zero-fills for any
+        day with no recorded playback. Page renderers can use it directly
+        as bar-chart data.
+        """
+        user = _require_user(request)
+        days = max(1, min(int(days or 1), 365))
+        rows = _conn().execute(
+            "SELECT day, seconds FROM daily_watch_seconds "
+            "WHERE user_id = ? "
+            "  AND day >= date('now', 'localtime', ?) "
+            "  AND day <= date('now', 'localtime') "
+            "ORDER BY day",
+            (user["id"], f"-{days - 1} days"),
+        ).fetchall()
+        by_day = {r["day"]: r["seconds"] for r in rows}
+        # Build the contiguous date range so the chart has uniform bars.
+        from datetime import date, timedelta
+        today = _conn().execute(
+            "SELECT date('now','localtime') AS d"
+        ).fetchone()["d"]
+        end = date.fromisoformat(today)
+        start = end - timedelta(days=days - 1)
+        out = []
+        cur = start
+        total_seconds = 0
+        while cur <= end:
+            ds = cur.isoformat()
+            secs = by_day.get(ds, 0)
+            total_seconds += secs
+            out.append({
+                "day": ds,
+                "seconds": secs,
+                "minutes": int(secs // 60),
+            })
+            cur += timedelta(days=1)
+        return {
+            "days": out,
+            "total_seconds": total_seconds,
+            "total_minutes": int(total_seconds // 60),
+            "today_seconds": by_day.get(today, 0),
+            "today_minutes": int(by_day.get(today, 0) // 60),
+        }
+
     @app.put("/api/me/password")
     def api_change_my_password(body: PasswordChangeBody, request: Request):
         user = _require_user(request)
@@ -397,6 +445,30 @@ def create_app(
 
     # --- Progress API ----------------------------------------------------
 
+    # Cap each progress-update delta at this many seconds — large jumps
+    # (seeking, scrubbing, resuming after a long pause) shouldn't inflate
+    # the watch-time tally. Heartbeat fires roughly every 5s; 60s is a
+    # generous ceiling that still rejects any meaningful seek.
+    _WATCH_DELTA_CAP_SECS = 60.0
+
+    def _record_watch_seconds(
+        conn, user_id: int, prev_pos: float, new_pos: float
+    ) -> None:
+        """Add the (clamped) playback delta to today's tally bucket.
+        Negative deltas (scrub-back) → 0. Large positives (seek) → cap.
+        Day key is server-local YYYY-MM-DD so the tally aligns with the
+        user's calendar day, not UTC."""
+        delta = max(0.0, min(new_pos - prev_pos, _WATCH_DELTA_CAP_SECS))
+        if delta <= 0:
+            return
+        conn.execute(
+            "INSERT INTO daily_watch_seconds (user_id, day, seconds) "
+            "VALUES (?, date('now','localtime'), ?) "
+            "ON CONFLICT(user_id, day) DO UPDATE SET "
+            "  seconds = seconds + excluded.seconds",
+            (user_id, int(round(delta))),
+        )
+
     @app.put("/api/progress/{media_id}")
     def api_put_progress(media_id: int, body: ProgressBody, request: Request):
         user = _require_user(request)
@@ -405,6 +477,12 @@ def create_app(
         row = conn.execute("SELECT id FROM media WHERE id = ?", (media_id,)).fetchone()
         if not row:
             raise HTTPException(404, "media not found")
+        prev = conn.execute(
+            "SELECT position_seconds FROM media_progress "
+            "WHERE user_id = ? AND media_id = ?",
+            (user["id"], media_id),
+        ).fetchone()
+        prev_pos = prev["position_seconds"] if prev else 0.0
         with conn:
             conn.execute(
                 """
@@ -417,6 +495,7 @@ def create_app(
                 """,
                 (user["id"], media_id, body.position_seconds, body.duration_seconds),
             )
+            _record_watch_seconds(conn, user["id"], prev_pos, body.position_seconds)
         return {"ok": True}
 
     @app.get("/api/progress/{media_id}")
@@ -483,6 +562,12 @@ def create_app(
             "SELECT 1 FROM tv_episodes WHERE id = ?", (episode_id,)
         ).fetchone() is None:
             raise HTTPException(404, "episode not found")
+        prev = conn.execute(
+            "SELECT position_seconds FROM episode_progress "
+            "WHERE user_id = ? AND episode_id = ?",
+            (user["id"], episode_id),
+        ).fetchone()
+        prev_pos = prev["position_seconds"] if prev else 0.0
         with conn:
             conn.execute(
                 """
@@ -496,6 +581,7 @@ def create_app(
                 """,
                 (user["id"], episode_id, body.position_seconds, body.duration_seconds),
             )
+            _record_watch_seconds(conn, user["id"], prev_pos, body.position_seconds)
         return {"ok": True}
 
     @app.get("/api/progress/episode/{episode_id}")
@@ -2591,6 +2677,23 @@ scanned automatically</strong> as soon as you add them.</p>
             current_season=row["season"],
             user_id=user["id"] if user else None,
         )
+        # 'Reset series progress' lets the user wipe their own progress
+        # for every episode of this show — for re-watching later. Only
+        # affects this user; other watchers' progress is untouched.
+        reset_series_html = ""
+        if user:
+            confirm = (
+                f"Reset progress for every episode of "
+                f"{row['show_title']!r}? You'll start over from the beginning."
+            ).replace("'", "")
+            reset_series_html = (
+                f"<form method='post' action='/progress/show/{row['show_id']}/reset' "
+                f"class='reset-series' "
+                f"onsubmit='return confirm(\"{html.escape(confirm)}\");'>"
+                "<button type='submit'>Reset series progress</button>"
+                "</form>"
+            )
+
         body = (
             f"<div class='theater'>"
             f"<video id='player' controls autoplay playsinline preload='auto' "
@@ -2602,6 +2705,7 @@ scanned automatically</strong> as soon as you add them.</p>
             f"<h2>{html.escape(row['show_title'])} &mdash; {ep_label}</h2>"
             f"<p>{html.escape(row['title_guess'] or '')}</p>"
             f"{admin_actions}"
+            f"{reset_series_html}"
             "</div>"
             f"{strip_html}"
             + _player_progress_js(f"/api/progress/episode/{episode_id}")
@@ -2954,12 +3058,99 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
             notice = f"<p class='error'>{html.escape(error)}</p>"
         elif ok:
             notice = f"<p class='hint' style='color:#6c6'>{html.escape(ok)}</p>"
+
+        # Watch-time stats — reuse the same SQL the JSON endpoint uses,
+        # rendered as inline bar charts with no chart library.
+        def _stats(days: int) -> dict:
+            conn2 = _conn()
+            rows = conn2.execute(
+                "SELECT day, seconds FROM daily_watch_seconds "
+                "WHERE user_id = ? "
+                "  AND day >= date('now', 'localtime', ?) "
+                "  AND day <= date('now', 'localtime') "
+                "ORDER BY day",
+                (user["id"], f"-{days - 1} days"),
+            ).fetchall()
+            by_day = {r["day"]: r["seconds"] for r in rows}
+            from datetime import date, timedelta
+            today_str = conn2.execute(
+                "SELECT date('now','localtime') AS d"
+            ).fetchone()["d"]
+            end = date.fromisoformat(today_str)
+            start = end - timedelta(days=days - 1)
+            buckets = []
+            cur = start
+            total = 0
+            while cur <= end:
+                ds = cur.isoformat()
+                secs = by_day.get(ds, 0)
+                total += secs
+                buckets.append((ds, secs))
+                cur += timedelta(days=1)
+            return {
+                "buckets": buckets,
+                "total": total,
+                "today": by_day.get(today_str, 0),
+                "today_str": today_str,
+            }
+
+        def _fmt_minutes(secs: int) -> str:
+            mins = secs // 60
+            if mins < 60:
+                return f"{mins} min"
+            hours, m = divmod(mins, 60)
+            return f"{hours} h {m:02d} min"
+
+        def _bars(buckets: list, label: str) -> str:
+            peak = max((s for _, s in buckets), default=0) or 1
+            bars = []
+            for ds, secs in buckets:
+                pct = int(round(100 * secs / peak)) if peak else 0
+                weekday_short = ""
+                try:
+                    from datetime import date
+                    weekday_short = date.fromisoformat(ds).strftime("%a")
+                except Exception:
+                    pass
+                bars.append(
+                    "<div class='watch-bar' "
+                    f"title='{html.escape(ds)}: {_fmt_minutes(secs)}'>"
+                    f"<div class='watch-bar-fill' style='height:{pct}%;'></div>"
+                    f"<div class='watch-bar-label'>{html.escape(weekday_short)}</div>"
+                    "</div>"
+                )
+            return (
+                f"<div class='watch-chart-wrap'>"
+                f"<div class='watch-chart-label'>{html.escape(label)}</div>"
+                f"<div class='watch-chart'>{''.join(bars)}</div>"
+                "</div>"
+            )
+
+        week = _stats(7)
+        month = _stats(30)
+        stats_html = (
+            "<h3>Watch time</h3>"
+            "<div class='watch-tally'>"
+            "<div class='watch-tally-today'>"
+            f"<span class='watch-tally-num'>{_fmt_minutes(week['today'])}</span>"
+            "<span class='watch-tally-cap'>watched today</span>"
+            "</div>"
+            "<div class='watch-tally-aggregates'>"
+            f"<span><strong>{_fmt_minutes(week['total'])}</strong> in the last 7 days</span>"
+            f"<span><strong>{_fmt_minutes(month['total'])}</strong> in the last 30 days</span>"
+            "</div>"
+            "</div>"
+            f"{_bars(week['buckets'], 'Last 7 days')}"
+            f"{_bars(month['buckets'], 'Last 30 days')}"
+        )
+
         body = f"""
 <h2>Account</h2>
 <p>Signed in as <strong>{html.escape(user['username'])}</strong>"""
         body += " (admin)" if user["is_admin"] else ""
         body += f"""</p>
 {notice}
+{stats_html}
 <h3>Change password</h3>
 <form method='post' action='/account/password' class='auth'>
   <label>Current password <input name='current_password' type='password' required></label>
@@ -3154,6 +3345,40 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
             )
         return RedirectResponse("/", status_code=303)
 
+    def _reset_show_progress(conn, user_id: int, show_id: int) -> int:
+        """Mark every episode in this show 'unwatched' for the given user.
+        Other users' progress is untouched. Returns the row count deleted."""
+        if conn.execute(
+            "SELECT 1 FROM media WHERE id = ? AND kind = 'tv_show'",
+            (show_id,),
+        ).fetchone() is None:
+            raise HTTPException(404, "show not found")
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM episode_progress "
+                "WHERE user_id = ? "
+                "  AND episode_id IN ("
+                "    SELECT id FROM tv_episodes WHERE show_id = ?"
+                "  )",
+                (user_id, show_id),
+            )
+        return cur.rowcount or 0
+
+    @app.post("/api/progress/show/{show_id}/reset")
+    def api_reset_show_progress(show_id: int, request: Request):
+        user = _require_user(request)
+        deleted = _reset_show_progress(_conn(), user["id"], show_id)
+        return {"ok": True, "deleted": deleted}
+
+    @app.post("/progress/show/{show_id}/reset")
+    def page_reset_show_progress(show_id: int, request: Request):
+        """Form variant for the 'Reset series progress' button on the
+        episode watch page. Land on /show/{id} after — the redirect will
+        send you to the first episode again, ready to re-binge."""
+        user = _require_user(request)
+        _reset_show_progress(_conn(), user["id"], show_id)
+        return RedirectResponse(f"/show/{show_id}", status_code=303)
+
     return app
 
 
@@ -3326,6 +3551,41 @@ section.media-section h2 .kind { color: #888; font-size: .7em; font-weight: norm
              padding: .15rem .45rem; border-radius: 3px;
              pointer-events: none; }
 .cw-badge.cw-next { background: rgba(34, 102, 153, .92); color: #fff; }
+.reset-series { display: inline-block; margin: .5rem 0; }
+.reset-series button { background: transparent; color: #888;
+                       border: 1px solid #333; border-radius: 3px;
+                       padding: .25rem .65rem; font: inherit;
+                       cursor: pointer; font-size: .85em; }
+.reset-series button:hover { color: #f88; border-color: #844; }
+.watch-tally { display: flex; gap: 2rem; align-items: center;
+                background: #181818; border: 1px solid #333;
+                border-radius: 4px; padding: 1rem; margin-bottom: 1rem; }
+.watch-tally-today { display: flex; flex-direction: column; }
+.watch-tally-num { color: #6cf; font-size: 2em; font-weight: 600;
+                    line-height: 1; font-variant-numeric: tabular-nums; }
+.watch-tally-cap { color: #888; font-size: .85em; margin-top: .15rem; }
+.watch-tally-aggregates { display: flex; flex-direction: column;
+                           gap: .25rem; color: #aaa; font-size: .9em; }
+.watch-tally-aggregates strong { color: #eee;
+                                  font-variant-numeric: tabular-nums; }
+.watch-chart-wrap { margin: .75rem 0 1.25rem; }
+.watch-chart-label { color: #888; font-size: .85em; margin-bottom: .35rem; }
+.watch-chart { display: flex; align-items: flex-end; gap: 4px;
+                height: 100px; background: #181818;
+                border: 1px solid #333; border-radius: 4px;
+                padding: .5rem; }
+.watch-bar { flex: 1 1 0; display: flex; flex-direction: column;
+              align-items: stretch; justify-content: flex-end;
+              min-width: 8px; position: relative; height: 100%; }
+.watch-bar-fill { background: linear-gradient(to top, #346, #6cf);
+                   border-radius: 2px 2px 0 0; min-height: 1px; }
+.watch-bar-label { position: absolute; bottom: -1.1em; left: 0; right: 0;
+                    text-align: center; color: #666; font-size: .65em;
+                    pointer-events: none; }
+.watch-chart-wrap:has(.watch-bar:nth-child(8)) .watch-bar-label {
+    /* Hide weekday labels on the 30-day chart (too dense) */
+    display: none;
+}
 img.show-poster { max-width: 200px; max-height: 300px; float: right;
                    margin: 0 0 1rem 1rem; border-radius: 4px; }
 form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }

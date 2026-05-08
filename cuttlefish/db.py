@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -141,6 +141,17 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         poster_path   TEXT,
         size_bytes    INTEGER,
         encoded_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # Daily per-user watch tally — server-local-time YYYY-MM-DD as the
+    # day key, seconds incremented from progress-update deltas. Pre-
+    # aggregated so /account stat queries are O(days), not O(events).
+    """
+    CREATE TABLE IF NOT EXISTS daily_watch_seconds (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day     TEXT    NOT NULL,
+        seconds INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day)
     )
     """,
 )
