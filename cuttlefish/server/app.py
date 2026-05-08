@@ -4115,11 +4115,20 @@ def _page(
     title: str, body_html: str, user: Optional[dict], body_class: str = ""
 ) -> str:
     if user:
-        admin_link = " · <a href='/admin'>Admin</a>" if user['is_admin'] else ""
+        # Three distinct things in the userbar — name them so they're not
+        # confusable: the signed-in username (label only), the per-user
+        # account/settings page, and the admin panel (admin-only).
+        # Previously the username link and the admin link were both labeled
+        # 'admin' for an admin user, which read as two identical buttons
+        # doing different things.
+        admin_link = (
+            " · <a href='/admin'>Admin settings</a>"
+            if user['is_admin'] else ""
+        )
         userbar = (
             "<span class='userbar'>"
-            f"<a href='/account'>{html.escape(user['username'])}</a>"
-            + (" (admin)" if user['is_admin'] else "")
+            f"<span class='username'>{html.escape(user['username'])}</span>"
+            + " · <a href='/account'>Your account</a>"
             + admin_link
             + " · <form method='post' action='/logout'><button>Log out</button></form>"
             + "</span>"

@@ -537,4 +537,27 @@ def test_admin_link_not_in_header_for_non_admin(tmp_path):
     # Non-admin should not see the admin link in their header
     # (they will see "/admin" mentioned elsewhere, hence checking for the link
     # form specifically).
-    assert "<a href='/admin'>Admin</a>" not in r.text
+    assert "<a href='/admin'>Admin settings</a>" not in r.text
+
+
+def test_userbar_distinguishes_account_and_admin_settings(tmp_path):
+    """Header used to show the username as a link AND a separate 'Admin'
+    link — for an admin user that read as two identical buttons doing
+    different things. The labels should make their roles unambiguous."""
+    db_path, _ = _populate(tmp_path)
+    client = _admin_client(db_path)
+    r = client.get("/")
+    assert r.status_code == 200
+    # Username appears as a label, not the link target — the destination
+    # is described by the link text instead.
+    assert "<span class='username'>admin</span>" in r.text
+    assert "<a href='/account'>Your account</a>" in r.text
+    assert "<a href='/admin'>Admin settings</a>" in r.text
+
+
+def test_userbar_for_non_admin_omits_admin_settings(tmp_path):
+    db_path, _ = _populate(tmp_path)
+    client = _non_admin_client(db_path)
+    r = client.get("/")
+    assert "<a href='/account'>Your account</a>" in r.text
+    assert "Admin settings" not in r.text
