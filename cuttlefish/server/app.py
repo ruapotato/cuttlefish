@@ -604,6 +604,168 @@ def create_app(
         rows = _conn().execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def _iter_cleanup_candidates_for_library(conn, library_id: int) -> list[dict]:
+        """Originals (movies + tv episodes) in this library that have an
+        encoded version on disk and are still a separate source file —
+        i.e. ready for the user to free space by deleting the original.
+
+        Items where stat() raises (path went missing, permission flap)
+        are skipped silently — they aren't candidates anyway."""
+        out: list[dict] = []
+        media_rows = conn.execute(
+            "SELECT m.id, m.title_guess, m.source_path, "
+            "       e.video_path, e.size_bytes "
+            "FROM media m "
+            "JOIN encoded_files e ON e.media_id = m.id "
+            "WHERE m.library_id = ?",
+            (library_id,),
+        ).fetchall()
+        for r in media_rows:
+            src = Path(r["source_path"])
+            video = Path(r["video_path"])
+            try:
+                if src.is_file() and src.resolve() != video.resolve():
+                    out.append({
+                        "kind": "media",
+                        "item_id": r["id"],
+                        "title": r["title_guess"],
+                        "original_path": str(src),
+                        "encoded_path": str(video),
+                        "original_size": src.stat().st_size,
+                        "encoded_size": r["size_bytes"] or 0,
+                    })
+            except OSError:
+                continue
+        ep_rows = conn.execute(
+            "SELECT e.id, e.title_guess, e.source_path, e.season, e.episode, "
+            "       ee.video_path, ee.size_bytes, "
+            "       m.title_guess AS show_title "
+            "FROM tv_episodes e "
+            "JOIN encoded_episodes ee ON ee.episode_id = e.id "
+            "JOIN media m ON m.id = e.show_id "
+            "WHERE m.library_id = ?",
+            (library_id,),
+        ).fetchall()
+        for r in ep_rows:
+            src = Path(r["source_path"])
+            video = Path(r["video_path"])
+            try:
+                if src.is_file() and src.resolve() != video.resolve():
+                    ep_label = (
+                        f"S{int(r['season']):02d}E{int(r['episode']):02d}"
+                        if r["season"] is not None and r["episode"] is not None
+                        else ""
+                    )
+                    title = " ".join(p for p in [
+                        r["show_title"] or "",
+                        ep_label,
+                        r["title_guess"] or "",
+                    ] if p).strip()
+                    out.append({
+                        "kind": "episode",
+                        "item_id": r["id"],
+                        "title": title,
+                        "original_path": str(src),
+                        "encoded_path": str(video),
+                        "original_size": src.stat().st_size,
+                        "encoded_size": r["size_bytes"] or 0,
+                    })
+            except OSError:
+                continue
+        return out
+
+    def _compute_cleanup_library_status(conn) -> dict:
+        """Per-library cleanup rollup: how many originals are ready to
+        delete in each library, and how much disk that frees. Used to
+        render the bulk-cleanup section + the JSON polling endpoint."""
+        libs = conn.execute(
+            "SELECT id, name FROM libraries ORDER BY id"
+        ).fetchall()
+        rollup = []
+        for lib in libs:
+            cands = _iter_cleanup_candidates_for_library(conn, lib["id"])
+            total = sum(c["original_size"] for c in cands)
+            rollup.append({
+                "id": lib["id"],
+                "name": lib["name"],
+                "candidate_count": len(cands),
+                "total_bytes": total,
+                "total_bytes_human": _human_size(total),
+            })
+        return {"libraries": rollup}
+
+    @app.get("/api/admin/cleanup/library-status")
+    def api_admin_cleanup_library_status(request: Request):
+        """JSON view of the per-library cleanup rollup — count of originals
+        ready to delete + total bytes that'd be freed. The page polls this
+        so a refresh during a delete shows the current candidate counts."""
+        _require_admin(request)
+        return _compute_cleanup_library_status(_conn())
+
+    @app.post("/api/admin/cleanup/library/{library_id}")
+    def api_admin_bulk_cleanup_library(library_id: int, request: Request):
+        """Delete every original-with-encoded-sibling in the library. Each
+        item is re-verified just before deletion (encoded file still
+        present, source is still a different file) — so a candidate that
+        becomes invalid between page-load and click is just skipped, not
+        silently mishandled. Synchronous: returns deleted-count + freed-
+        bytes after all candidates have been processed."""
+        _require_admin(request)
+        conn = _conn()
+        if conn.execute(
+            "SELECT 1 FROM libraries WHERE id = ?", (library_id,)
+        ).fetchone() is None:
+            raise HTTPException(404, "library not found")
+        cands = _iter_cleanup_candidates_for_library(conn, library_id)
+        deleted = 0
+        freed = 0
+        errors: list[dict] = []
+        for c in cands:
+            src = Path(c["original_path"])
+            video = Path(c["encoded_path"])
+            try:
+                if not video.is_file() or video.stat().st_size == 0:
+                    errors.append({
+                        "path": str(src),
+                        "error": "encoded file missing or empty",
+                    })
+                    continue
+                if not src.is_file():
+                    # Already gone; skip silently.
+                    continue
+                if src.resolve() == video.resolve():
+                    errors.append({
+                        "path": str(src),
+                        "error": "original IS the encoded file",
+                    })
+                    continue
+                sz = src.stat().st_size
+                src.unlink()
+                # Re-point the row so future scans don't re-create the
+                # original entry from the now-missing path.
+                with conn:
+                    if c["kind"] == "media":
+                        conn.execute(
+                            "UPDATE media SET source_path = ? WHERE id = ?",
+                            (str(video.parent), c["item_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tv_episodes SET source_path = ? WHERE id = ?",
+                            (str(video.parent), c["item_id"]),
+                        )
+                deleted += 1
+                freed += sz
+            except Exception as e:
+                errors.append({"path": str(src), "error": str(e)})
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "freed_bytes": freed,
+            "freed_bytes_human": _human_size(freed),
+            "errors": errors,
+        }
+
     @app.get("/api/admin/cleanup-candidates")
     def api_admin_cleanup_candidates(request: Request):
         """List media where an encoded version exists and the original is still
@@ -1478,56 +1640,74 @@ scanned automatically</strong> as soon as you add them.</p>
     @app.get("/admin/cleanup", response_class=HTMLResponse)
     def page_admin_cleanup(request: Request):
         user = _require_admin(request)
-        rows = _conn().execute(
-            "SELECT m.id, m.title_guess, m.source_path, e.video_path, e.size_bytes "
-            "FROM media m JOIN encoded_files e ON e.media_id = m.id "
-            "ORDER BY m.title_guess"
-        ).fetchall()
-        candidates = []
-        for r in rows:
-            src = Path(r["source_path"])
-            video = Path(r["video_path"])
-            if src.is_file() and src.resolve() != video.resolve():
-                candidates.append({
-                    "id": r["id"],
-                    "title": r["title_guess"],
-                    "original": src,
-                    "encoded": video,
-                    "encoded_size": r["size_bytes"],
-                    "original_size": src.stat().st_size,
-                })
-        if not candidates:
-            body = (
-                "<h2>Cleanup originals</h2>"
+        conn = _conn()
+
+        # Per-library bulk section (server-rendered for refresh-stability).
+        cleanup_state = _compute_cleanup_library_status(conn)
+        bulk_html = _render_cleanup_dashboard(cleanup_state)
+
+        # Per-item table: combined movies + episodes from EVERY library.
+        # Reuse the same per-library iterator so the per-item view always
+        # matches what a bulk action would target.
+        all_candidates: list[dict] = []
+        lib_rows = conn.execute("SELECT id, name FROM libraries").fetchall()
+        for lib in lib_rows:
+            for c in _iter_cleanup_candidates_for_library(conn, lib["id"]):
+                c2 = dict(c)
+                c2["library"] = lib["name"]
+                all_candidates.append(c2)
+        all_candidates.sort(key=lambda c: (c["library"], c["title"]))
+
+        if not all_candidates:
+            items_html = (
                 "<p class='empty'>No originals are ready for deletion. "
                 "Encode something first, then come back.</p>"
-                "<p><a href='/admin'>&larr; Admin</a></p>"
             )
         else:
-            row_html = "".join(
-                f"<tr>"
-                f"<td>{html.escape(c['title'])}</td>"
-                f"<td><span class='size'>{_human_size(c['original_size'])}</span><br>"
-                f"<small>{html.escape(c['original'].name)}</small></td>"
-                f"<td><span class='size'>{_human_size(c['encoded_size'])}</span><br>"
-                f"<small>{html.escape(c['encoded'].name)}</small></td>"
-                f"<td><form method='post' action='/admin/originals/{c['id']}/delete' "
-                f"onsubmit='return confirm(\"Delete original {html.escape(c['original'].name)}? This cannot be undone.\");'>"
-                f"<button type='submit'>Delete original</button></form></td>"
-                f"</tr>"
-                for c in candidates
-            )
-            body = (
-                "<h2>Cleanup originals</h2>"
-                "<p class='hint'>The originals listed below have an encoded "
-                "version on disk. Deleting them frees space and finishes the "
-                "clean Title/Title.mp4 layout.</p>"
+            def _row(c: dict) -> str:
+                orig = Path(c["original_path"])
+                enc = Path(c["encoded_path"])
+                if c["kind"] == "media":
+                    action = f"/admin/originals/{c['item_id']}/delete"
+                else:
+                    action = f"/admin/originals/episode/{c['item_id']}/delete"
+                confirm_msg = (
+                    f"Delete original {orig.name}? This cannot be undone."
+                ).replace("'", "")
+                return (
+                    f"<tr>"
+                    f"<td>{html.escape(c['library'])}</td>"
+                    f"<td>{html.escape(c['title'])}</td>"
+                    f"<td><span class='size'>{_human_size(c['original_size'])}</span><br>"
+                    f"<small>{html.escape(orig.name)}</small></td>"
+                    f"<td><span class='size'>{_human_size(c['encoded_size'])}</span><br>"
+                    f"<small>{html.escape(enc.name)}</small></td>"
+                    f"<td><form method='post' action='{action}' "
+                    f"onsubmit='return confirm(\"{html.escape(confirm_msg)}\");'>"
+                    f"<button type='submit'>Delete original</button></form></td>"
+                    f"</tr>"
+                )
+            row_html = "".join(_row(c) for c in all_candidates)
+            items_html = (
+                "<h3>Per-item</h3>"
+                "<p class='hint'>One row per original ready for deletion. "
+                "Use the bulk button above for whole-library cleanup.</p>"
                 "<table class='admin'><thead><tr>"
-                "<th>title</th><th>original</th><th>encoded</th><th></th>"
+                "<th>library</th><th>title</th><th>original</th>"
+                "<th>encoded</th><th></th>"
                 "</tr></thead><tbody>"
                 f"{row_html}</tbody></table>"
-                "<p><a href='/admin'>&larr; Admin</a></p>"
             )
+
+        body = (
+            "<h2>Cleanup originals</h2>"
+            "<p class='hint'>The originals listed below have an encoded "
+            "version on disk. Deleting them frees space and finishes the "
+            "clean Title/Title.mp4 layout.</p>"
+            f"{bulk_html}"
+            f"{items_html}"
+            "<p><a href='/admin'>&larr; Admin</a></p>"
+        )
         return _page("Cleanup originals", body, user=user)
 
     @app.get("/admin/encode", response_class=HTMLResponse)
@@ -1973,6 +2153,34 @@ scanned automatically</strong> as soon as you add them.</p>
         if include_images:
             qs += "&include_images=1"
         return RedirectResponse(f"/admin/cruft?{qs}", status_code=303)
+
+    @app.post("/admin/originals/episode/{episode_id}/delete")
+    def page_admin_delete_original_episode(episode_id: int, request: Request):
+        _require_admin(request)
+        conn = _conn()
+        row = conn.execute(
+            "SELECT e.source_path, ee.video_path, ee.size_bytes "
+            "FROM tv_episodes e JOIN encoded_episodes ee ON ee.episode_id = e.id "
+            "WHERE e.id = ?",
+            (episode_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "episode has no encoded version yet")
+        src = Path(row["source_path"])
+        video = Path(row["video_path"])
+        if not video.is_file() or video.stat().st_size == 0:
+            raise HTTPException(409, "encoded file missing or empty")
+        if not src.is_file():
+            return RedirectResponse("/admin/cleanup", status_code=303)
+        if src.resolve() == video.resolve():
+            raise HTTPException(409, "original IS the encoded file")
+        src.unlink()
+        with conn:
+            conn.execute(
+                "UPDATE tv_episodes SET source_path = ? WHERE id = ?",
+                (str(video.parent), episode_id),
+            )
+        return RedirectResponse("/admin/cleanup", status_code=303)
 
     @app.post("/admin/originals/{media_id}/delete")
     def page_admin_delete_original(media_id: int, request: Request):
@@ -3525,6 +3733,145 @@ def _render_jobs_dashboard(
         "</tr></thead><tbody>"
         f"{rows}</tbody></table>"
         f"{_BULK_JOBS_JS}"
+        "</div>"
+    )
+
+
+_BULK_CLEANUP_JS = r"""
+<script>(function(){
+  // Bulk cleanup is synchronous server-side (file unlinks are fast), so we
+  // don't need a job queue or polling worker. We just confirm with the
+  // user, POST, show a spinner, then reload the page so the candidate
+  // counts (server-rendered) reflect the post-delete state.
+  var root = document.getElementById('cleanup-dashboard');
+  if (!root) return;
+
+  function escHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function setStatus(libId, state, text, spin) {
+    var span = root.querySelector(
+      '.bulk-cleanup-status[data-lib-id="' + libId + '"]'
+    );
+    if (!span) return;
+    span.classList.remove('idle', 'working', 'running', 'done', 'failed');
+    span.classList.add(state);
+    var spinner = spin
+      ? '<span class="asr-spinner" aria-hidden="true"></span> '
+      : '';
+    span.innerHTML = spinner + '<span class="asr-text">' + escHtml(text) + '</span>';
+  }
+
+  function refreshCounts() {
+    fetch('/api/admin/cleanup/library-status', { credentials: 'same-origin' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(state) {
+        if (!state) return;
+        (state.libraries || []).forEach(function(lib) {
+          var row = root.querySelector('tr[data-lib-id="' + lib.id + '"]');
+          if (!row) return;
+          var cnt = row.querySelector('.cleanup-count');
+          var sz  = row.querySelector('.cleanup-size');
+          if (cnt) cnt.textContent = String(lib.candidate_count || 0);
+          if (sz)  sz.textContent  = lib.total_bytes_human || '';
+          var btn = row.querySelector('button.bulk-cleanup-btn');
+          if (btn) {
+            btn.disabled = (lib.candidate_count || 0) === 0;
+            btn.dataset.count = String(lib.candidate_count || 0);
+            btn.dataset.sizeHuman = lib.total_bytes_human || '';
+          }
+        });
+      })
+      .catch(function() {});
+  }
+
+  root.querySelectorAll('button.bulk-cleanup-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var libId = btn.dataset.libId;
+      var count = btn.dataset.count;
+      var sizeHuman = btn.dataset.sizeHuman || '';
+      if (!count || count === '0') return;
+      var msg =
+        'Delete ' + count + ' original file(s) from this library? ' +
+        'Frees ' + sizeHuman + '. This cannot be undone.';
+      if (!confirm(msg)) return;
+      btn.disabled = true;
+      setStatus(libId, 'working', 'Deleting…', true);
+      fetch('/api/admin/cleanup/library/' + libId, {
+        method: 'POST', credentials: 'same-origin',
+      })
+        .then(function(r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(j) {
+          var msg2 =
+            '✓ Deleted ' + (j.deleted || 0) + ' file(s), freed ' +
+            (j.freed_bytes_human || '0 B') + '.';
+          if (j.errors && j.errors.length) {
+            msg2 += ' ' + j.errors.length + ' error(s) — see /admin/jobs.';
+          }
+          setStatus(libId, 'done', msg2, false);
+          refreshCounts();
+          // Soft-reload so the per-item table updates too.
+          setTimeout(function() { window.location.reload(); }, 1200);
+        })
+        .catch(function(e) {
+          setStatus(libId, 'failed', 'Delete failed: ' + e.message, false);
+          btn.disabled = false;
+        });
+    });
+  });
+})();</script>
+"""
+
+
+def _render_cleanup_dashboard(state: dict) -> str:
+    """Per-library bulk-cleanup section: counts + total bytes + a confirm-
+    then-delete button per library. Synchronous on the server side; the
+    JS just shows a spinner and reloads on success."""
+    libs = state.get("libraries") or []
+    if not libs:
+        return ""
+    rows_html = "".join(
+        f"<tr data-lib-id='{lib['id']}'>"
+        f"<td>{html.escape(lib['name'])}</td>"
+        f"<td class='jobs-cnt cleanup-count'>{lib['candidate_count']}</td>"
+        f"<td class='size cleanup-size'>{_human_size(lib['total_bytes'])}</td>"
+        f"<td>"
+        f"<button type='button' class='bulk-cleanup-btn' "
+        f"data-lib-id='{lib['id']}' "
+        f"data-count='{lib['candidate_count']}' "
+        f"data-size-human='{_human_size(lib['total_bytes'])}'"
+        f"{' disabled' if lib['candidate_count'] == 0 else ''}>"
+        "Delete originals</button>"
+        f"</td>"
+        f"<td><span class='bulk-cleanup-status' "
+        f"data-lib-id='{lib['id']}'></span></td>"
+        f"</tr>"
+        for lib in libs
+    )
+    return (
+        "<div id='cleanup-dashboard'>"
+        "<h3>Bulk: whole library</h3>"
+        "<p class='hint'>Deletes all originals (movies + TV episodes) in "
+        "the library that have an encoded version on disk. Each item is "
+        "re-checked just before deletion — if the encoded file is somehow "
+        "missing, that original is left in place. <strong>This cannot be "
+        "undone.</strong></p>"
+        "<table class='admin'><thead><tr>"
+        "<th>library</th>"
+        "<th>candidates</th>"
+        "<th>frees</th>"
+        "<th></th>"
+        "<th></th>"
+        "</tr></thead><tbody>"
+        f"{rows_html}</tbody></table>"
+        f"{_BULK_CLEANUP_JS}"
         "</div>"
     )
 

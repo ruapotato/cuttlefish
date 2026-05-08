@@ -333,6 +333,124 @@ def test_admin_delete_original_via_form(tmp_path):
     assert not original.exists()
 
 
+@ffmpeg_required
+def test_cleanup_library_status_endpoint(tmp_path):
+    """Per-library candidate count + freeable bytes, used by the
+    /admin/cleanup bulk dashboard."""
+    db_path, media_id = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_id, ffmpeg=FFMPEG)
+    client = _admin_client(db_path)
+    r = client.get("/api/admin/cleanup/library-status")
+    assert r.status_code == 200
+    body = r.json()
+    libs = body["libraries"]
+    assert len(libs) == 1
+    lib = libs[0]
+    assert lib["candidate_count"] == 1
+    assert lib["total_bytes"] > 0
+    # Server provides the human-readable form so the JS doesn't need its
+    # own _human_size copy.
+    assert isinstance(lib["total_bytes_human"], str)
+
+
+@ffmpeg_required
+def test_admin_cleanup_page_has_bulk_section(tmp_path):
+    """/admin/cleanup now has the same bulk-per-library affordance the
+    other admin pages have, with confirm-then-delete and live counts."""
+    db_path, media_id = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_id, ffmpeg=FFMPEG)
+    client = _admin_client(db_path)
+    r = client.get("/admin/cleanup")
+    assert r.status_code == 200
+    assert "Bulk: whole library" in r.text
+    assert "id='cleanup-dashboard'" in r.text
+    assert "class='bulk-cleanup-btn'" in r.text
+    assert "/api/admin/cleanup/library-status" in r.text
+    # Per-library candidate count should be server-rendered.
+    assert "cleanup-count" in r.text
+    assert "cleanup-size" in r.text
+
+
+@ffmpeg_required
+def test_bulk_cleanup_deletes_all_originals(tmp_path):
+    """POST to /api/admin/cleanup/library/{id} synchronously deletes
+    every original-with-encoded-sibling in that library and reports the
+    count + bytes freed."""
+    db_path, media_id = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_id, ffmpeg=FFMPEG)
+    conn = db.connect(db_path)
+    original = Path(conn.execute(
+        "SELECT source_path FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["source_path"])
+    encoded = Path(conn.execute(
+        "SELECT video_path FROM encoded_files WHERE media_id = ?", (media_id,)
+    ).fetchone()["video_path"])
+    assert original.is_file()
+    assert encoded.is_file()
+
+    library_id = conn.execute(
+        "SELECT library_id FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["library_id"]
+    client = _admin_client(db_path)
+    r = client.post(f"/api/admin/cleanup/library/{library_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted"] == 1
+    assert body["freed_bytes"] > 0
+    assert body["errors"] == []
+    # Original is gone, encoded file is untouched.
+    assert not original.exists()
+    assert encoded.is_file()
+    # Subsequent call: nothing to delete (re-pointed source_path is the
+    # encoded directory, which doesn't satisfy the candidate criteria).
+    r2 = client.post(f"/api/admin/cleanup/library/{library_id}")
+    assert r2.json()["deleted"] == 0
+
+
+def test_bulk_cleanup_404_unknown_library(tmp_path):
+    db_path, _ = _populate(tmp_path)
+    client = _admin_client(db_path)
+    r = client.post("/api/admin/cleanup/library/99999")
+    assert r.status_code == 404
+
+
+@ffmpeg_required
+def test_bulk_cleanup_only_targets_its_own_library(tmp_path):
+    """Bulk delete on library A must NOT touch any originals in library B."""
+    db_path, media_a = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_a, ffmpeg=FFMPEG)
+
+    # Add a second library with its own movie + encoded version.
+    other_root = tmp_path / "other_lib"; other_root.mkdir()
+    _make_video(other_root / "B.mp4")
+    conn = db.connect(db_path)
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO libraries (name, root_path) VALUES ('other', ?)",
+            (str(other_root),),
+        )
+        lib_b = cur.lastrowid
+    scanner.scan_library(conn, lib_b, other_root)
+    media_b = conn.execute(
+        "SELECT id FROM media WHERE library_id = ?", (lib_b,)
+    ).fetchone()["id"]
+    encoder.encode_media(conn, media_b, ffmpeg=FFMPEG)
+    original_b = Path(conn.execute(
+        "SELECT source_path FROM media WHERE id = ?", (media_b,)
+    ).fetchone()["source_path"])
+    assert original_b.is_file()
+
+    # Bulk-clean only library A.
+    library_a = conn.execute(
+        "SELECT library_id FROM media WHERE id = ?", (media_a,)
+    ).fetchone()["library_id"]
+    client = _admin_client(db_path)
+    r = client.post(f"/api/admin/cleanup/library/{library_a}")
+    assert r.json()["deleted"] == 1
+    # Library B's original is still there.
+    assert original_b.is_file()
+
+
 def test_admin_link_in_header_for_admin(tmp_path):
     db_path, _ = _populate(tmp_path)
     client = _admin_client(db_path)
