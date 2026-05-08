@@ -620,18 +620,32 @@ def create_app(
             "WHERE m.library_id = ?",
             (library_id,),
         ).fetchall()
+        def _sidecar_summary(src: Path) -> tuple[int, int]:
+            """Returns (sidecar_count, sidecar_bytes) for orphan sidecars
+            that will also be unlinked when this source is deleted."""
+            paths = _orphan_sidecars_for(src)
+            try:
+                return len(paths), sum(p.stat().st_size for p in paths)
+            except OSError:
+                return 0, 0
+
         for r in media_rows:
             src = Path(r["source_path"])
             video = Path(r["video_path"])
             try:
                 if src.is_file() and src.resolve() != video.resolve():
+                    sc_count, sc_bytes = _sidecar_summary(src)
+                    osize = src.stat().st_size
                     out.append({
                         "kind": "media",
                         "item_id": r["id"],
                         "title": r["title_guess"],
                         "original_path": str(src),
                         "encoded_path": str(video),
-                        "original_size": src.stat().st_size,
+                        "original_size": osize,
+                        "sidecar_count": sc_count,
+                        "sidecar_bytes": sc_bytes,
+                        "total_bytes": osize + sc_bytes,
                         "encoded_size": r["size_bytes"] or 0,
                     })
             except OSError:
@@ -661,13 +675,18 @@ def create_app(
                         ep_label,
                         r["title_guess"] or "",
                     ] if p).strip()
+                    sc_count, sc_bytes = _sidecar_summary(src)
+                    osize = src.stat().st_size
                     out.append({
                         "kind": "episode",
                         "item_id": r["id"],
                         "title": title,
                         "original_path": str(src),
                         "encoded_path": str(video),
-                        "original_size": src.stat().st_size,
+                        "original_size": osize,
+                        "sidecar_count": sc_count,
+                        "sidecar_bytes": sc_bytes,
+                        "total_bytes": osize + sc_bytes,
                         "encoded_size": r["size_bytes"] or 0,
                     })
             except OSError:
@@ -684,7 +703,9 @@ def create_app(
         rollup = []
         for lib in libs:
             cands = _iter_cleanup_candidates_for_library(conn, lib["id"])
-            total = sum(c["original_size"] for c in cands)
+            # total_bytes includes sidecars (subtitles + posters) so the
+            # 'frees X' preview matches what actually gets unlinked.
+            total = sum(c["total_bytes"] for c in cands)
             rollup.append({
                 "id": lib["id"],
                 "name": lib["name"],
@@ -717,7 +738,8 @@ def create_app(
         ).fetchone() is None:
             raise HTTPException(404, "library not found")
         cands = _iter_cleanup_candidates_for_library(conn, library_id)
-        deleted = 0
+        deleted = 0  # number of source videos removed
+        files_total = 0  # videos + sidecars
         freed = 0
         errors: list[dict] = []
         for c in cands:
@@ -739,8 +761,10 @@ def create_app(
                         "error": "original IS the encoded file",
                     })
                     continue
-                sz = src.stat().st_size
-                src.unlink()
+                # Removes the source video AND any orphan sidecars
+                # (subtitles/posters) sharing its stem — otherwise users
+                # see leftover .srt/.asr.srt files in the library root.
+                files, freed_one = _delete_original_with_sidecars(src)
                 # Re-point the row so future scans don't re-create the
                 # original entry from the now-missing path.
                 with conn:
@@ -755,12 +779,14 @@ def create_app(
                             (str(video.parent), c["item_id"]),
                         )
                 deleted += 1
-                freed += sz
+                files_total += files
+                freed += freed_one
             except Exception as e:
                 errors.append({"path": str(src), "error": str(e)})
         return {
             "ok": True,
             "deleted": deleted,
+            "files_deleted": files_total,  # videos + sidecars
             "freed_bytes": freed,
             "freed_bytes_human": _human_size(freed),
             "errors": errors,
@@ -814,7 +840,7 @@ def create_app(
             raise HTTPException(404, "original file not present")
         if src.resolve() == video.resolve():
             raise HTTPException(409, "original IS the encoded file; refusing")
-        src.unlink()
+        files, freed = _delete_original_with_sidecars(src)
         # Re-point the media row at the encoded path so subsequent scans don't
         # re-create the original entry.
         with conn:
@@ -822,7 +848,7 @@ def create_app(
                 "UPDATE media SET source_path = ? WHERE id = ?",
                 (str(video.parent), media_id),
             )
-        return {"ok": True, "deleted": str(src)}
+        return {"ok": True, "deleted": str(src), "files_deleted": files, "freed_bytes": freed}
 
     # --- Admin: external lookups ----------------------------------------
 
@@ -2174,7 +2200,7 @@ scanned automatically</strong> as soon as you add them.</p>
             return RedirectResponse("/admin/cleanup", status_code=303)
         if src.resolve() == video.resolve():
             raise HTTPException(409, "original IS the encoded file")
-        src.unlink()
+        _delete_original_with_sidecars(src)
         with conn:
             conn.execute(
                 "UPDATE tv_episodes SET source_path = ? WHERE id = ?",
@@ -2201,7 +2227,7 @@ scanned automatically</strong> as soon as you add them.</p>
             return RedirectResponse("/admin/cleanup", status_code=303)
         if src.resolve() == video.resolve():
             raise HTTPException(409, "original IS the encoded file")
-        src.unlink()
+        _delete_original_with_sidecars(src)
         with conn:
             conn.execute(
                 "UPDATE media SET source_path = ? WHERE id = ?",
@@ -3401,6 +3427,63 @@ def _human_size(n: Optional[int]) -> str:
             return f"{f:.1f} {u}" if u != "B" else f"{int(f)} B"
         f /= 1024
     return f"{int(n)} B"
+
+
+# Sidecar extensions that we treat as "co-deletion candidates" when
+# removing an original video file. Subtitle and poster formats only —
+# we don't auto-delete .nfo / .txt cruft here (that's the /admin/sweep
+# flow). Order follows cuttlefish.cruft for consistency.
+_SIDECAR_EXTS = (
+    ".srt", ".vtt", ".ass", ".ssa",
+    ".jpg", ".jpeg", ".png", ".webp",
+)
+
+
+def _orphan_sidecars_for(src: Path) -> list[Path]:
+    """Sidecar files (subtitles/posters) sitting next to `src` that share
+    its stem and would be left dangling if we just unlinked `src`.
+
+    Matches both `<stem>.<ext>` and `<stem>.asr.<ext>` so ASR-generated
+    SRTs are cleaned up alongside the source video they were transcribed
+    from. Restricting to known sidecar extensions and exact-name matches
+    avoids false positives like an unrelated file that happens to begin
+    with the same prefix.
+    """
+    if not src.parent.is_dir():
+        return []
+    stem = src.stem
+    parent = src.parent
+    out: list[Path] = []
+    for ext in _SIDECAR_EXTS:
+        for name in (f"{stem}{ext}", f"{stem}.asr{ext}"):
+            p = parent / name
+            if p == src:
+                continue
+            if p.is_file():
+                out.append(p)
+    return out
+
+
+def _delete_original_with_sidecars(src: Path) -> tuple[int, int]:
+    """Unlink the original video and any orphan sidecars next to it.
+    Returns (files_deleted, bytes_freed). Sidecar failures are silently
+    skipped so a flaky permission on one .srt doesn't abort the whole
+    cleanup; the source-video unlink failing still raises so the caller
+    can surface the error to the admin."""
+    sidecars = _orphan_sidecars_for(src)
+    sz = src.stat().st_size
+    src.unlink()
+    files = 1
+    freed = sz
+    for sc in sidecars:
+        try:
+            ssz = sc.stat().st_size
+            sc.unlink()
+            files += 1
+            freed += ssz
+        except OSError:
+            pass
+    return files, freed
 
 
 def _kind_label(kind: str) -> str:

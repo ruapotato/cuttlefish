@@ -415,6 +415,78 @@ def test_bulk_cleanup_404_unknown_library(tmp_path):
 
 
 @ffmpeg_required
+def test_bulk_cleanup_also_removes_orphan_sidecars(tmp_path):
+    """When the original video is deleted, any subtitle/poster sidecars
+    sitting next to it (sharing the stem) should be removed too —
+    otherwise the library root is left with leftover .srt / .asr.srt /
+    .jpg files that look broken next to the clean Title/ folder."""
+    db_path, media_id = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_id, ffmpeg=FFMPEG)
+    conn = db.connect(db_path)
+    original = Path(conn.execute(
+        "SELECT source_path FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["source_path"])
+    assert original.is_file()
+
+    # Drop sidecars next to the source: original sub, ASR sub, and a poster.
+    stem = original.stem
+    parent = original.parent
+    sidecar_srt = parent / f"{stem}.srt"
+    sidecar_asr = parent / f"{stem}.asr.srt"
+    sidecar_jpg = parent / f"{stem}.jpg"
+    sidecar_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n")
+    sidecar_asr.write_text("1\n00:00:00,000 --> 00:00:01,000\nasr\n")
+    sidecar_jpg.write_bytes(b"\xff\xd8\xff\xe0fake jpg")
+    expected_freed_min = (
+        original.stat().st_size
+        + sidecar_srt.stat().st_size
+        + sidecar_asr.stat().st_size
+        + sidecar_jpg.stat().st_size
+    )
+    # Also drop a non-sidecar (.nfo) — should NOT be touched by cleanup.
+    unrelated = parent / f"{stem}.nfo"
+    unrelated.write_text("metadata")
+
+    library_id = conn.execute(
+        "SELECT library_id FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["library_id"]
+    client = _admin_client(db_path)
+    r = client.post(f"/api/admin/cleanup/library/{library_id}")
+    body = r.json()
+    assert body["deleted"] == 1
+    # files_deleted = 1 video + 3 sidecars
+    assert body["files_deleted"] == 4
+    assert body["freed_bytes"] >= expected_freed_min
+
+    assert not original.exists()
+    assert not sidecar_srt.exists()
+    assert not sidecar_asr.exists()
+    assert not sidecar_jpg.exists()
+    # Non-sidecar cruft is preserved (handled by /admin/sweep, not here).
+    assert unrelated.is_file()
+
+
+@ffmpeg_required
+def test_per_item_delete_also_removes_orphan_sidecars(tmp_path):
+    """The single-item form on /admin/cleanup should clean up sidecars
+    too — same orphan-leftover problem if it doesn't."""
+    db_path, media_id = _populate(tmp_path)
+    encoder.encode_media(db.connect(db_path), media_id, ffmpeg=FFMPEG)
+    conn = db.connect(db_path)
+    original = Path(conn.execute(
+        "SELECT source_path FROM media WHERE id = ?", (media_id,)
+    ).fetchone()["source_path"])
+    sidecar = original.parent / f"{original.stem}.asr.srt"
+    sidecar.write_text("dummy asr srt")
+
+    client = _admin_client(db_path)
+    r = client.post(f"/admin/originals/{media_id}/delete", follow_redirects=False)
+    assert r.status_code == 303
+    assert not original.exists()
+    assert not sidecar.exists()
+
+
+@ffmpeg_required
 def test_bulk_cleanup_only_targets_its_own_library(tmp_path):
     """Bulk delete on library A must NOT touch any originals in library B."""
     db_path, media_a = _populate(tmp_path)
