@@ -193,8 +193,9 @@ def test_search_page_no_query_shows_form(tmp_path):
 def test_continue_watching_requires_login(tmp_path):
     db_path = _populate_for_search(tmp_path)
     client = TestClient(create_app(db_path=db_path))
+    # Only the JSON API stays — the standalone HTML page was retired in
+    # favor of the home-page section.
     assert client.get("/api/continue-watching").status_code == 401
-    assert client.get("/continue-watching").status_code == 401
 
 
 def test_continue_watching_returns_progress_items(tmp_path):
@@ -237,23 +238,17 @@ def test_continue_watching_skips_zero_position(tmp_path):
     assert data["media"] == []
 
 
-def test_continue_watching_page_renders(tmp_path):
+def test_continue_watching_renders_on_home_with_progress_label(tmp_path):
+    """The home-page Continue Watching section shows a progress badge
+    (mm:ss / mm:ss) on the in-progress card."""
     db_path = _populate_for_search(tmp_path)
     client = TestClient(create_app(db_path=db_path))
     client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
     client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
     media_id = db.connect(db_path).execute("SELECT id FROM media WHERE kind='movie' LIMIT 1").fetchone()["id"]
     client.put(f"/api/progress/{media_id}", json={"position_seconds": 90.0, "duration_seconds": 600.0})
-    r = client.get("/continue-watching")
+    r = client.get("/")
     assert r.status_code == 200
+    assert "Continue watching" in r.text
     # The progress label "1:30 / 10:00 (15%)"
     assert "1:30" in r.text and "10:00" in r.text
-
-
-def test_header_shows_continue_watching_for_logged_in_user(tmp_path):
-    db_path = _populate_for_search(tmp_path)
-    client = TestClient(create_app(db_path=db_path))
-    client.post("/api/auth/register", data={"username": "a", "password": "secret123"})
-    client.post("/api/auth/login", data={"username": "a", "password": "secret123"})
-    r = client.get("/")
-    assert "/continue-watching" in r.text

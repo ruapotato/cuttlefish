@@ -1,5 +1,5 @@
-"""Tests for delete-progress, mark-watched, and the form variants used on
-the /continue-watching page."""
+"""Tests for delete-progress, mark-watched, and the form variants the
+home page's Continue Watching section's actions still post to."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -86,12 +86,15 @@ def test_delete_episode_progress(tmp_path):
     assert client.get(f"/api/progress/episode/{ep_id}").json()["position_seconds"] == 0.0
 
 
-def test_form_mark_watched_redirects(tmp_path):
+def test_form_mark_watched_redirects_home(tmp_path):
+    """The form-redirect destination moved to / when the standalone
+    /continue-watching page was retired in favor of the home-page
+    section."""
     db_path, media_id = _setup(tmp_path)
     client = _logged_in(db_path)
     r = client.post(f"/progress/{media_id}/watched", follow_redirects=False)
     assert r.status_code == 303
-    assert r.headers["location"] == "/continue-watching"
+    assert r.headers["location"] == "/"
 
 
 def test_form_reset_redirects(tmp_path):
@@ -100,14 +103,5 @@ def test_form_reset_redirects(tmp_path):
     client.put(f"/api/progress/{media_id}", json={"position_seconds": 90.0})
     r = client.post(f"/progress/{media_id}/reset", follow_redirects=False)
     assert r.status_code == 303
+    assert r.headers["location"] == "/"
     assert client.get(f"/api/progress/{media_id}").json()["position_seconds"] == 0.0
-
-
-def test_continue_watching_page_shows_action_buttons(tmp_path):
-    db_path, media_id = _setup(tmp_path)
-    client = _logged_in(db_path)
-    client.put(f"/api/progress/{media_id}", json={"position_seconds": 90.0, "duration_seconds": 600.0})
-    r = client.get("/continue-watching")
-    assert r.status_code == 200
-    assert "Mark watched" in r.text
-    assert "Reset" in r.text

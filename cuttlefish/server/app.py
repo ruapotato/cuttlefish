@@ -3123,40 +3123,11 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
             "audiobooks": [dict(r) for r in book_rows],
         }
 
-    @app.get("/continue-watching", response_class=HTMLResponse)
-    def page_continue_watching(request: Request):
-        user = _require_user(request)
-        data = api_continue_watching(request)
-        blocks = []
-        if data["media"]:
-            lis = "".join(
-                f"<li><a href='{_watch_url(r['kind'], r['id'])}'>"
-                f"{html.escape(r['title_guess'])}</a> "
-                f"<span class='kind'>{_progress_label(r)}</span> "
-                f"{_progress_actions(r['id'], 'media')}</li>"
-                for r in data["media"]
-            )
-            blocks.append(f"<h3>Movies / books</h3><ul class='media'>{lis}</ul>")
-        if data["episodes"]:
-            lis = "".join(
-                f"<li><a href='/watch/episode/{r['id']}'>"
-                f"{html.escape(r['show_title'])} S{r['season']:02d}E{r['episode']:02d}"
-                f"</a> <span class='kind'>{_progress_label(r)}</span> "
-                f"{_progress_actions(r['id'], 'episode')}</li>"
-                for r in data["episodes"]
-            )
-            blocks.append(f"<h3>TV episodes</h3><ul class='episodes'>{lis}</ul>")
-        if data["audiobooks"]:
-            lis = "".join(
-                f"<li><a href='/book/{r['id']}'>{html.escape(r['title_guess'])}</a></li>"
-                for r in data["audiobooks"]
-            )
-            blocks.append(f"<h3>Audiobooks</h3><ul class='media'>{lis}</ul>")
-        if not blocks:
-            body = "<h2>Continue Watching</h2><p class='empty'>Nothing in progress yet.</p>"
-        else:
-            body = "<h2>Continue Watching</h2>" + "".join(blocks)
-        return _page("Continue Watching", body, user=user)
+    # The standalone /continue-watching HTML page used to be a text list;
+    # the home page now hosts a thumbnail-based 'Continue watching'
+    # section above the kind grids, so the standalone page is redundant.
+    # /api/continue-watching (the JSON endpoint) is kept as a small public
+    # affordance — nothing in-app needs it now, but it's a stable shape.
 
     @app.post("/progress/{media_id}/reset")
     def page_reset_progress(media_id: int, request: Request):
@@ -3166,12 +3137,12 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
                 "DELETE FROM media_progress WHERE user_id = ? AND media_id = ?",
                 (user["id"], media_id),
             )
-        return RedirectResponse("/continue-watching", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/progress/{media_id}/watched")
     def page_mark_watched(media_id: int, request: Request):
         api_mark_watched(media_id, request)
-        return RedirectResponse("/continue-watching", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/progress/episode/{episode_id}/reset")
     def page_reset_episode_progress(episode_id: int, request: Request):
@@ -3181,7 +3152,7 @@ becomes a 'target'. From here you can pause / play / seek that target.</p>
                 "DELETE FROM episode_progress WHERE user_id = ? AND episode_id = ?",
                 (user["id"], episode_id),
             )
-        return RedirectResponse("/continue-watching", status_code=303)
+        return RedirectResponse("/", status_code=303)
 
     return app
 
@@ -3364,22 +3335,6 @@ form.search button { padding: .4rem .8rem; background: #245; color: #eee;
                       border: 1px solid #468; border-radius: 3px; cursor: pointer; }
 nav.top { display: flex; gap: 1rem; margin-bottom: 1rem; font-size: .9em; }
 """
-
-
-def _progress_actions(item_id: int, kind: str) -> str:
-    """Inline forms for 'mark watched' and 'reset' next to a continue-watching row."""
-    base = f"/progress/{item_id}" if kind == "media" else f"/progress/episode/{item_id}"
-    watched = (
-        f"<form method='post' action='{base}/watched' style='display:inline'>"
-        "<button type='submit'>Mark watched</button></form>"
-        if kind == "media"
-        else ""
-    )
-    reset = (
-        f"<form method='post' action='{base}/reset' style='display:inline'>"
-        "<button type='submit'>Reset</button></form>"
-    )
-    return f"<span class='actions'>{watched} {reset}</span>"
 
 
 def _episode_strip_html(
@@ -4280,7 +4235,6 @@ def _page(
         nav = (
             "<nav class='top'>"
             "<a href='/'>Libraries</a>"
-            "<a href='/continue-watching'>Continue Watching</a>"
             "<a href='/search'>Search</a>"
             "<a href='/cast'>Cast</a>"
             "</nav>"
