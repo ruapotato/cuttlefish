@@ -2250,6 +2250,112 @@ scanned automatically</strong> as soon as you add them.</p>
 
     # --- HTML pages ------------------------------------------------------
 
+    # Threshold above which a partly-watched item is considered "done" —
+    # if you stopped within the last 5% of the runtime, you almost
+    # certainly meant to finish, and continue-watching should suggest
+    # the NEXT episode rather than re-prompting the credits roll.
+    _DONE_FRAC = 0.95
+
+    def _continue_watching_cards(conn, user_id: int, limit: int = 12) -> list[dict]:
+        """Card-shaped list of items the user can resume right now.
+
+        Movies/books: in-progress items not yet finished.
+        TV: ONE tile per show — the in-progress episode, OR the next
+        episode if the most recent watched one ended (>= _DONE_FRAC of
+        its duration). If the show is fully done, drop it from the list.
+        """
+        cards: list[dict] = []
+
+        movie_rows = conn.execute(
+            "SELECT m.id, m.kind, m.title_guess, "
+            "       mp.position_seconds, mp.duration_seconds, mp.updated_at "
+            "FROM media_progress mp "
+            "JOIN media m ON m.id = mp.media_id "
+            "WHERE mp.user_id = ? AND mp.position_seconds > 0 "
+            "  AND m.kind != 'tv_show' "
+            "  AND (mp.duration_seconds IS NULL "
+            "       OR mp.position_seconds < mp.duration_seconds * ?) "
+            "ORDER BY mp.updated_at DESC",
+            (user_id, _DONE_FRAC),
+        ).fetchall()
+        for r in movie_rows:
+            cards.append({
+                "kind": r["kind"],
+                "poster_id": r["id"],
+                "title": r["title_guess"],
+                "subtitle": _progress_label(dict(r)),
+                "watch_url": _watch_url(r["kind"], r["id"]),
+                "is_next": False,
+                "updated_at": r["updated_at"],
+            })
+
+        # Most recent episode_progress per show, in recency order.
+        ep_rows = conn.execute(
+            "SELECT e.id AS episode_id, e.show_id, e.season, e.episode, "
+            "       e.title_guess AS ep_title, "
+            "       m.title_guess AS show_title, "
+            "       ep.position_seconds, ep.duration_seconds, ep.updated_at "
+            "FROM episode_progress ep "
+            "JOIN tv_episodes e ON e.id = ep.episode_id "
+            "JOIN media m ON m.id = e.show_id "
+            "WHERE ep.user_id = ? "
+            "ORDER BY ep.updated_at DESC",
+            (user_id,),
+        ).fetchall()
+        seen_shows: set[int] = set()
+        for r in ep_rows:
+            show_id = r["show_id"]
+            if show_id in seen_shows:
+                continue
+            seen_shows.add(show_id)
+            ep_id = r["episode_id"]
+            season = r["season"]
+            episode = r["episode"]
+            is_next = False
+            subtitle = _progress_label(dict(r))
+            duration = r["duration_seconds"]
+            if (
+                duration
+                and r["position_seconds"] is not None
+                and r["position_seconds"] >= duration * _DONE_FRAC
+            ):
+                # The latest watched episode finished — surface the NEXT
+                # one as continue-watching for this show.
+                nxt = conn.execute(
+                    "SELECT id, season, episode, title_guess "
+                    "FROM tv_episodes "
+                    "WHERE show_id = ? AND ("
+                    "  (season = ? AND episode > ?) OR season > ?"
+                    ") "
+                    "ORDER BY season, episode LIMIT 1",
+                    (show_id, season, episode, season),
+                ).fetchone()
+                if nxt is None:
+                    # End of series for this user — nothing to continue.
+                    continue
+                ep_id = nxt["id"]
+                season = nxt["season"]
+                episode = nxt["episode"]
+                is_next = True
+                subtitle = "Up next"
+            ep_label = (
+                f"S{int(season):02d}E{int(episode):02d}"
+                if season is not None and episode is not None else ""
+            )
+            title = f"{r['show_title']} {ep_label}".strip()
+            cards.append({
+                "kind": "episode",
+                "poster_id": show_id,  # show poster, not episode poster
+                "title": title,
+                "subtitle": subtitle,
+                "watch_url": f"/watch/episode/{ep_id}",
+                "is_next": is_next,
+                "updated_at": r["updated_at"],
+            })
+
+        cards.sort(key=lambda c: c["updated_at"] or "", reverse=True)
+        return cards[:limit]
+
     @app.get("/", response_class=HTMLResponse)
     def page_index(request: Request):
         user = _current_user(request)
@@ -2316,14 +2422,46 @@ scanned automatically</strong> as soon as you add them.</p>
                 f"</section>"
             )
 
+        # Continue-watching section: prepended above the kind sections so
+        # users land directly on resumable items. Hidden when the user
+        # has no progress (or isn't logged in).
+        cw_html = ""
+        if user:
+            cw = _continue_watching_cards(conn, user["id"], limit=12)
+            if cw:
+                def render_cw_card(c: dict) -> str:
+                    badge = (
+                        "<span class='cw-badge cw-next'>Up next</span>"
+                        if c["is_next"]
+                        else f"<span class='cw-badge'>{html.escape(c['subtitle'])}</span>"
+                    )
+                    return (
+                        f"<li class='card'>"
+                        f"<a href='{c['watch_url']}'>"
+                        f"<div class='poster-wrap'>"
+                        f"<div class='no-poster'></div>"
+                        f"<img src='/poster/{c['poster_id']}' alt='' loading='lazy' "
+                        f"onerror=\"this.style.display='none'\">"
+                        f"{badge}"
+                        f"</div>"
+                        f"<span class='card-title'>{html.escape(c['title'])}</span>"
+                        f"</a></li>"
+                    )
+                cw_html = (
+                    "<section class='media-section continue-watching'>"
+                    "<h2>Continue watching</h2>"
+                    f"<ul class='cards'>{''.join(render_cw_card(c) for c in cw)}</ul>"
+                    "</section>"
+                )
+
         if not parts:
-            body = (
+            body = cw_html + (
                 "<p class='empty'>No media yet. "
                 "Open <a href='/admin/libraries'>Admin → Libraries</a> and "
                 "click <strong>Scan</strong>.</p>"
             )
         else:
-            body = "".join(parts)
+            body = cw_html + "".join(parts)
         return _page("Cuttlefish", body, user=user)
 
     @app.get("/library/{library_id}", response_class=HTMLResponse)
@@ -3211,6 +3349,12 @@ ul.cards li.card .card-kind { display: block; font-size: .75em; color: #888; }
 section.media-section { margin-bottom: 2rem; }
 section.media-section h2 { color: #eee; margin-bottom: .75rem; }
 section.media-section h2 .kind { color: #888; font-size: .7em; font-weight: normal; }
+.cw-badge { position: absolute; left: .35rem; bottom: .35rem;
+             background: rgba(0, 0, 0, .78); color: #eee;
+             font-size: .72em; font-weight: 500;
+             padding: .15rem .45rem; border-radius: 3px;
+             pointer-events: none; }
+.cw-badge.cw-next { background: rgba(34, 102, 153, .92); color: #fff; }
 img.show-poster { max-width: 200px; max-height: 300px; float: right;
                    margin: 0 0 1rem 1rem; border-radius: 4px; }
 form.search { display: flex; gap: .5rem; margin-bottom: 1rem; }
